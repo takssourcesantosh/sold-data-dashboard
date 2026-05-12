@@ -1,0 +1,16 @@
+[build]
+builder = "nixpacks"
+buildCommand = "npm install && npm run build"
+
+[deploy]
+startCommand = "npm start"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 300
+
+# Environment variables to set in Railway dashboard:
+#   NODE_ENV=production
+#   JWT_SECRET=<long random string>
+#   USERS=admin:<password>:admin,<username>:<password>:user
+#
+# IMPORTANT: Add a Volume mounted at /app/data to persist your database.
+# Without a volume, data is lost on every redeploy.

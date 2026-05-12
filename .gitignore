@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+.env
+*.db
+public/sql-wasm.wasm
+.claude/
+
+src/db.js
+src/config/users.js
+src/utils/csv.js
