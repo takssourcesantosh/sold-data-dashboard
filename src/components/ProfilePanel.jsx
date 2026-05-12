@@ -38,6 +38,7 @@ export default function ProfilePanel({ currentUser, onClose, onProfileUpdate }) 
 
   const handleAvatarFile = async (file) => {
     if (!file) return
+    if (file.size > 10 * 1024 * 1024) { setAvatarMsg('Image too large (max 10 MB)'); return }
     try {
       const b64 = await resizeToBase64(file)
       setAvatarPreview(b64)

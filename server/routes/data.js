@@ -132,7 +132,7 @@ router.put('/cell', requireAdmin, (req, res) => {
 
 router.get('/distinct/:col', requireAuth, (req, res) => {
   const values = getDistinctValues(req.params.col)
-  res.json({ values })
+  res.json(values)
 })
 
 router.get('/export', requireAuth, (req, res) => {

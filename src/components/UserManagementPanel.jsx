@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import UserAvatar from './UserAvatar'
 import { listUsers, createUser, updateUser, deleteUser } from '../api'
 
@@ -80,7 +80,7 @@ export default function UserManagementPanel({ currentUser, onClose }) {
     setLoading(false)
   }
 
-  if (users === null && loading) { load() }
+  useEffect(() => { load() }, [])
 
   const handleCreate = async (data) => {
     const user = await createUser(data)
