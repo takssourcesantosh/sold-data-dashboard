@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import UserAvatar from './UserAvatar'
 import { listUsers, createUser, updateUser, deleteUser } from '../api'
+import { useToast, useConfirm, useEscClose } from './Toast'
 
 function RoleBadge({ role }) {
   return <span className={`ump-role-badge ump-role-${role}`}>{role}</span>
@@ -45,7 +46,7 @@ function UserModal({ title, initial, onSave, onClose, isNew, isSelf }) {
           <label className="ump-label">{isNew ? 'Password' : 'New Password (leave blank to keep)'}</label>
           <input className="pp-input" type="password" value={password}
             onChange={e => { setPassword(e.target.value); setErr('') }}
-            placeholder={isNew ? 'Min 6 characters' : 'Leave blank to keep current'}
+            placeholder={isNew ? 'Min 10 chars, 2 char classes' : 'Leave blank to keep current'}
             autoComplete="new-password" />
 
           <label className="ump-label">Role</label>
@@ -73,6 +74,9 @@ export default function UserManagementPanel({ currentUser, onClose }) {
   const [users, setUsers]   = useState(null)
   const [loading, setLoading] = useState(true)
   const [modal, setModal]   = useState(null)  // null | 'add' | { user }
+  const toast = useToast()
+  const [ask, ConfirmModal] = useConfirm()
+  useEscClose(onClose)
 
   const load = async () => {
     setLoading(true)
@@ -95,9 +99,10 @@ export default function UserManagementPanel({ currentUser, onClose }) {
   }
 
   const handleDelete = async (user) => {
-    if (!window.confirm(`Delete user "${user.username}"? This cannot be undone.`)) return
+    const ok = await ask(`Delete user "${user.username}"? This cannot be undone.`, { danger: true, confirmLabel: 'Delete' })
+    if (!ok) return
     const res = await deleteUser(user.id)
-    if (res.error) { alert(res.error); return }
+    if (res.error) { toast.error(res.error); return }
     await load()
   }
 
@@ -107,7 +112,7 @@ export default function UserManagementPanel({ currentUser, onClose }) {
   }
 
   return (
-    <div className="pp-overlay" onMouseDown={onClose}>
+    <div className="pp-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
       <div className="ump-card" onMouseDown={e => e.stopPropagation()}>
         <div className="pp-header">
           <span className="pp-title">Manage Users</span>
@@ -171,6 +176,7 @@ export default function UserManagementPanel({ currentUser, onClose }) {
           onClose={() => setModal(null)}
           onSave={(data) => handleUpdate(modal.user.id, data)} />
       )}
+      {ConfirmModal}
     </div>
   )
 }

@@ -1,6 +1,7 @@
 import { useState, useRef } from 'react'
 import UserAvatar from './UserAvatar'
 import { updateMyPassword, updateMyAvatar } from '../api'
+import { useEscClose } from './Toast'
 
 async function resizeToBase64(file, size = 96) {
   return new Promise((resolve, reject) => {
@@ -23,6 +24,7 @@ async function resizeToBase64(file, size = 96) {
 }
 
 export default function ProfilePanel({ currentUser, onClose, onProfileUpdate }) {
+  useEscClose(onClose)
   const [avatarPreview, setAvatarPreview] = useState(null)
   const [avatarSaving, setAvatarSaving] = useState(false)
   const [avatarMsg, setAvatarMsg] = useState('')
@@ -81,7 +83,9 @@ export default function ProfilePanel({ currentUser, onClose, onProfileUpdate }) 
     e.preventDefault()
     setPwdErr(''); setPwdMsg('')
     if (newPwd !== confirmPwd) { setPwdErr('Passwords do not match'); return }
-    if (newPwd.length < 6)     { setPwdErr('Password must be at least 6 characters'); return }
+    if (newPwd.length < 10)    { setPwdErr('Password must be at least 10 characters'); return }
+    const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter(rx => rx.test(newPwd)).length
+    if (classes < 2)           { setPwdErr('Password must mix at least 2 of: lowercase, uppercase, digit, symbol'); return }
     setPwdSaving(true)
     try {
       await updateMyPassword(curPwd, newPwd)
@@ -138,7 +142,7 @@ export default function ProfilePanel({ currentUser, onClose, onProfileUpdate }) 
             <input className="pp-input" type="password" placeholder="Current password"
               value={curPwd} onChange={e => { setCurPwd(e.target.value); setPwdErr('') }}
               autoComplete="current-password" />
-            <input className="pp-input" type="password" placeholder="New password (min 6 chars)"
+            <input className="pp-input" type="password" placeholder="New password (min 10 chars, 2 char classes)"
               value={newPwd} onChange={e => { setNewPwd(e.target.value); setPwdErr('') }}
               autoComplete="new-password" />
             <input className="pp-input" type="password" placeholder="Confirm new password"

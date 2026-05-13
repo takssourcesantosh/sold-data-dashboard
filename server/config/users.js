@@ -1,6 +1,6 @@
 const DEFAULT_USERS = [
-  { username: 'admin',    password: 'admin123', role: 'admin' },
-  { username: 'belgiumd', password: 'bd2025',   role: 'user'  },
+  { username: 'admin',    password: 'Admin@BD2025!', role: 'admin' },
+  { username: 'belgiumd', password: 'BelgiumD@2025', role: 'user'  },
 ]
 
 export function getUsers() {

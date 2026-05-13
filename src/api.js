@@ -1,4 +1,20 @@
 const BASE = '/api'
+const DEFAULT_TIMEOUT_MS = 30_000
+
+// ── Multi-tab event bus ───────────────────────────────────────────────────────
+
+const bc = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('bd-app') : null
+
+export function broadcast(type, payload = null) {
+  bc?.postMessage({ type, payload, ts: Date.now() })
+}
+
+export function onBroadcast(handler) {
+  if (!bc) return () => {}
+  const fn = (e) => handler(e.data)
+  bc.addEventListener('message', fn)
+  return () => bc.removeEventListener('message', fn)
+}
 
 // ── Token / user storage ──────────────────────────────────────────────────────
 
@@ -20,7 +36,7 @@ export function setStoredUser(user) {
   else localStorage.removeItem('bd-user')
 }
 
-// ── Base fetch wrapper ────────────────────────────────────────────────────────
+// ── Base fetch wrapper with AbortController + timeout ────────────────────────
 
 async function apiFetch(path, opts = {}) {
   const headers = { ...opts.headers }
@@ -33,10 +49,27 @@ async function apiFetch(path, opts = {}) {
     body = JSON.stringify(body)
   }
 
-  const res = await fetch(BASE + path, { ...opts, headers, body })
+  const ctrl = new AbortController()
+  const timeout = opts.timeout ?? DEFAULT_TIMEOUT_MS
+  const timer = setTimeout(() => ctrl.abort(), timeout)
+
+  let res
+  try {
+    res = await fetch(BASE + path, { ...opts, headers, body, signal: ctrl.signal })
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Request timed out. Check your connection.')
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
-    throw new Error(err.error || res.statusText)
+    const msg = err.error || res.statusText
+    // Session-killing statuses → broadcast logout
+    if (res.status === 401 && (msg === 'Session revoked. Please log in again.' || msg === 'Invalid token' || msg === 'Unauthorized')) {
+      // let caller handle (they reload)
+    }
+    throw new Error(msg)
   }
   return res
 }
@@ -53,12 +86,16 @@ export async function loginApi(username, password) {
   if (!res.ok) throw new Error(data.error || 'Login failed')
   setToken(data.token)
   setStoredUser(data.user)
+  broadcast('auth.login', data.user)
   return data.user
 }
 
-export function logoutApi() {
+export async function logoutApi() {
+  // Best-effort server logout (bump token_version)
+  try { await apiFetch('/auth/logout', { method: 'POST', timeout: 5000 }) } catch {}
   setToken(null)
   setStoredUser(null)
+  broadcast('auth.logout')
 }
 
 // ── DB shims (mirror src/db.js API) ──────────────────────────────────────────
@@ -70,15 +107,11 @@ export async function initDb() {
   _meta = await res.json()
 }
 
-export function tableExists() {
-  return _meta.hasTable
-}
+export function tableExists() { return _meta.hasTable }
 
 export async function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [] } = {}) {
   const params = new URLSearchParams({
-    search,
-    sortCol: sortCol || '',
-    sortDir,
+    search, sortCol: sortCol || '', sortDir,
     columnFilters:   JSON.stringify(columnFilters),
     valueFilters:    JSON.stringify(valueFilters),
     advancedFilters: JSON.stringify(advancedFilters),
@@ -94,7 +127,6 @@ export async function createTableFromCSV(file, onProgress) {
   const form = new FormData()
   form.append('file', file)
 
-  // Simulate upload progress (fetch doesn't expose upload progress)
   let pct = 0
   const ticker = setInterval(() => {
     pct = Math.min(pct + 8, 85)
@@ -102,11 +134,13 @@ export async function createTableFromCSV(file, onProgress) {
   }, 250)
 
   try {
-    const res = await apiFetch('/data/upload', { method: 'POST', body: form })
+    const res = await apiFetch('/data/upload', { method: 'POST', body: form, timeout: 10 * 60_000 })
     clearInterval(ticker)
     onProgress?.(100)
     const data = await res.json()
     _meta = { hasTable: true, columns: data.columns, rowCount: data.rowCount }
+    broadcast('data.upload', { rowCount: data.rowCount })
+    return data
   } catch (err) {
     clearInterval(ticker)
     throw err
@@ -116,14 +150,17 @@ export async function createTableFromCSV(file, onProgress) {
 export async function appendFromCSV(file) {
   const form = new FormData()
   form.append('file', file)
-  const res = await apiFetch('/data/append', { method: 'POST', body: form })
+  const res = await apiFetch('/data/append', { method: 'POST', body: form, timeout: 10 * 60_000 })
   const data = await res.json()
   _meta.rowCount = data.rowCount
+  broadcast('data.append', { rowCount: data.rowCount })
+  return data
 }
 
 export async function clearAllData() {
   await apiFetch('/data', { method: 'DELETE' })
   _meta = { hasTable: false, columns: [], rowCount: 0 }
+  broadcast('data.clear')
 }
 
 export async function updateCell(rowId, column, value) {
@@ -133,22 +170,30 @@ export async function updateCell(rowId, column, value) {
 export async function getDistinctValues(column) {
   const res = await apiFetch(`/data/distinct/${encodeURIComponent(column)}`)
   const data = await res.json()
-  return data.values
+  // Server now returns {values, truncated}
+  if (data && Array.isArray(data.values)) return data
+  // Backwards compat fallback
+  return { values: Array.isArray(data) ? data : (data.values ?? []), truncated: false }
 }
 
-export async function exportCsvAndDownload() {
-  const res = await apiFetch('/data/export')
-  const text = await res.text()
-  const blob = new Blob([text], { type: 'text/csv;charset=utf-8;' })
+export async function exportCsvAndDownload(filters = {}) {
+  const params = new URLSearchParams({
+    search: filters.search || '',
+    sortCol: filters.sortCol || '',
+    sortDir: filters.sortDir || 'asc',
+    columnFilters: JSON.stringify(filters.columnFilters || {}),
+    valueFilters: JSON.stringify(filters.valueFilters || {}),
+    advancedFilters: JSON.stringify(filters.advancedFilters || []),
+  })
+  const res = await apiFetch(`/data/export?${params}`, { timeout: 5 * 60_000 })
+  const blob = await res.blob()
   const url = URL.createObjectURL(blob)
   const a = Object.assign(document.createElement('a'), { href: url, download: 'export.csv' })
   a.click()
   URL.revokeObjectURL(url)
 }
 
-export function getRowCount() {
-  return _meta.rowCount
-}
+export function getRowCount() { return _meta.rowCount }
 
 export async function listBackups() {
   const res = await apiFetch('/data/backups')
@@ -157,6 +202,16 @@ export async function listBackups() {
 
 export async function restoreBackup(slot) {
   const res = await apiFetch(`/data/restore/${slot}`, { method: 'POST' })
+  broadcast('data.restore', { slot })
+  return res.json()
+}
+
+export async function pinBackupApi(slot, pinned) {
+  await apiFetch(`/data/backups/${slot}/pin`, { method: 'POST', body: { pinned } })
+}
+
+export async function diffBackupApi(slot) {
+  const res = await apiFetch(`/data/diff/${slot}`)
   return res.json()
 }
 
@@ -194,5 +249,53 @@ export async function updateUser(id, patch) {
 
 export async function deleteUser(id) {
   const res = await apiFetch(`/users/${id}`, { method: 'DELETE' })
+  return res.json()
+}
+
+export async function listAudit() {
+  const res = await apiFetch('/users/audit')
+  return res.json()
+}
+
+// ── Saved Views ───────────────────────────────────────────────────────────────
+
+export async function listViewsApi() {
+  const res = await apiFetch('/data/views')
+  return res.json()
+}
+
+export async function saveViewApi(name, payload, shared = false) {
+  const res = await apiFetch('/data/views', { method: 'POST', body: { name, payload, shared } })
+  return res.json()
+}
+
+export async function updateViewApi(id, patch) {
+  const res = await apiFetch(`/data/views/${id}`, { method: 'PUT', body: patch })
+  return res.json()
+}
+
+export async function deleteViewApi(id) {
+  await apiFetch(`/data/views/${id}`, { method: 'DELETE' })
+}
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+
+export async function listAlertsApi() { return (await apiFetch('/data/alerts')).json() }
+export async function createAlertApi(body) { return (await apiFetch('/data/alerts', { method: 'POST', body })).json() }
+export async function updateAlertApi(id, body) { return (await apiFetch(`/data/alerts/${id}`, { method: 'PUT', body })).json() }
+export async function deleteAlertApi(id) { await apiFetch(`/data/alerts/${id}`, { method: 'DELETE' }) }
+export async function evaluateAlertsApi() { return (await apiFetch('/data/alerts/evaluate', { method: 'POST' })).json() }
+
+// ── Conditional Formatting ───────────────────────────────────────────────────
+
+export async function listFormattingApi() { return (await apiFetch('/data/formatting')).json() }
+export async function saveFormattingApi(rules) {
+  await apiFetch('/data/formatting', { method: 'PUT', body: { rules } })
+}
+
+// ── Pivot ─────────────────────────────────────────────────────────────────────
+
+export async function pivotApi({ rowDims, colDim, valueCol, agg }) {
+  const res = await apiFetch('/data/pivot', { method: 'POST', body: { rowDims, colDim, valueCol, agg } })
   return res.json()
 }

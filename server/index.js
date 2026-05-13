@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import express from 'express'
 import compression from 'compression'
+import helmet from 'helmet'
 import { fileURLToPath } from 'url'
 import path from 'path'
 import { existsSync, readFileSync } from 'fs'
@@ -9,22 +10,40 @@ import { getUsers } from './config/users.js'
 import authRouter from './routes/auth.js'
 import dataRouter from './routes/data.js'
 import usersRouter from './routes/users.js'
+import './auth-config.js' // fail-hard on missing JWT_SECRET in prod
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = process.env.PORT || 3001
+const isProd = process.env.NODE_ENV === 'production'
 
 const app = express()
 app.set('trust proxy', 1)
+
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: isProd ? {
+    useDefaults: true,
+    directives: {
+      'default-src': ["'self'"],
+      'script-src': ["'self'"],
+      'style-src': ["'self'", "'unsafe-inline'"], // CSS-in-JS
+      'img-src': ["'self'", 'data:', 'blob:'],
+      'font-src': ["'self'", 'data:'],
+      'connect-src': ["'self'"],
+    },
+  } : false,
+  crossOriginEmbedderPolicy: false,
+}))
+
 app.use(compression())
-app.use(express.json())
+app.use(express.json({ limit: '500kb' }))
 
 app.get('/api/health', (req, res) => res.json({ ok: true }))
 app.use('/api/auth', authRouter)
 app.use('/api/data', dataRouter)
 app.use('/api/users', usersRouter)
 
-// Serve built frontend in production
-if (process.env.NODE_ENV === 'production') {
+if (isProd) {
   const dist = path.join(__dirname, '..', 'dist')
   app.use(express.static(dist))
   app.get('*', (req, res) => {
@@ -32,8 +51,6 @@ if (process.env.NODE_ENV === 'production') {
     res.sendFile(path.join(dist, 'index.html'))
   })
 }
-
-// ── Auto-seed from public/sale-data.csv if DB is empty ───────────────────────
 
 async function seedIfEmpty() {
   if (tableExists()) return

@@ -1,3 +1,5 @@
+import { useConfirm, useEscClose } from './Toast'
+
 function fmtDate(iso) {
   try {
     return new Date(iso).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })
@@ -6,16 +8,21 @@ function fmtDate(iso) {
   }
 }
 
-export default function BackupPanel({ backups, onRestore, onClose }) {
-  const handleRestore = (b) => {
-    if (!window.confirm(
-      `Restore "${b.label}"?\n\nCurrent data will be saved as a backup first, then replaced with ${b.row_count.toLocaleString()} rows from this backup.`
-    )) return
+export default function BackupPanel({ backups, onRestore, onPin, onClose }) {
+  const [ask, ConfirmModal] = useConfirm()
+  useEscClose(onClose)
+
+  const handleRestore = async (b) => {
+    const ok = await ask(
+      `Restore "${b.label}"?\n\nCurrent data will be backed up first, then replaced with ${b.row_count.toLocaleString()} rows.`,
+      { danger: true, confirmLabel: 'Restore' }
+    )
+    if (!ok) return
     onRestore(b.slot)
   }
 
   return (
-    <div className="bp-overlay" onMouseDown={onClose}>
+    <div className="bp-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
       <div className="bp-card" onMouseDown={e => e.stopPropagation()}>
         <div className="bp-header">
           <div className="bp-title-wrap">
@@ -33,24 +40,35 @@ export default function BackupPanel({ backups, onRestore, onClose }) {
           ) : (
             <div className="bp-list">
               {backups.map((b, i) => (
-                <div className="bp-item" key={b.slot}>
+                <div className={`bp-item${b.pinned ? ' bp-item-pinned' : ''}`} key={b.slot}>
                   {i === 0 && <span className="bp-latest-tag">Latest</span>}
+                  {b.pinned && <span className="bp-pin-tag">📌 Pinned</span>}
                   <div className="bp-item-info">
                     <span className="bp-item-label" title={b.label}>{b.label}</span>
                     <span className="bp-item-meta">
                       {fmtDate(b.created_at)}&nbsp;·&nbsp;{b.row_count.toLocaleString()} rows
                     </span>
                   </div>
-                  <button className="btn bp-restore-btn" onClick={() => handleRestore(b)}>
-                    Restore
-                  </button>
+                  <div className="bp-item-actions">
+                    <button
+                      className={`btn bp-pin-btn${b.pinned ? ' bp-pin-btn--active' : ''}`}
+                      onClick={() => onPin(b.slot, !b.pinned)}
+                      title={b.pinned ? 'Unpin (allow auto-overwrite)' : 'Pin (protect from auto-overwrite)'}
+                    >
+                      {b.pinned ? '📌' : '📍'}
+                    </button>
+                    <button className="btn bp-restore-btn" onClick={() => handleRestore(b)}>
+                      Restore
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
           )}
-          <p className="bp-note">Up to 5 backups kept. Oldest removed automatically when limit is reached.</p>
+          <p className="bp-note">Up to 5 backups kept. Pin a backup to protect it from being auto-overwritten.</p>
         </div>
       </div>
+      {ConfirmModal}
     </div>
   )
 }

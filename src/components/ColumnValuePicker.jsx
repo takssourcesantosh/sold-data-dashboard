@@ -1,10 +1,17 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 
-export default function ColumnValuePicker({ col, anchorRect, allValues, activeValues, onApply, onClose }) {
+export default function ColumnValuePicker({ col, anchorRect, allValues, truncated, activeValues, onApply, onClose }) {
   // activeValues = string[] currently filtered, or null/undefined = all selected
-  const initialSet = useMemo(() => new Set(activeValues ?? allValues), []) // eslint-disable-line
+  const [checked, setChecked] = useState(() => new Set(activeValues ?? []))
 
-  const [checked, setChecked] = useState(initialSet)
+  // Initialize checked once when allValues first loads — don't wipe user ticks on re-renders.
+  const initRef = useRef(false)
+  useEffect(() => {
+    if (allValues.length > 0 && !initRef.current) {
+      setChecked(new Set(activeValues ?? allValues))
+      initRef.current = true
+    }
+  }, [allValues]) // eslint-disable-line
   const [search, setSearch] = useState('')
   const boxRef = useRef(null)
 
@@ -55,12 +62,13 @@ export default function ColumnValuePicker({ col, anchorRect, allValues, activeVa
   }
 
   const handleOk = () => {
-    const selected = [...checked]
-    // If everything in allValues is selected → treat as "no filter" (null)
-    if (selected.length === allValues.length) {
+    // Only include values that are in the known allValues set (discard stale selections)
+    const allSet = new Set(allValues)
+    const selected = [...checked].filter(v => allSet.has(v))
+    // "No filter" only when list is complete AND every value is checked
+    if (!truncated && selected.length === allValues.length) {
       onApply(col, null)
     } else if (selected.length === 0) {
-      // Nothing checked — keep filter that matches nothing
       onApply(col, [])
     } else {
       onApply(col, selected)
@@ -88,6 +96,9 @@ export default function ColumnValuePicker({ col, anchorRect, allValues, activeVa
         <div className="vp-header">
           <span className="vp-title">Filter: {col}</span>
         </div>
+        {truncated && (
+          <div className="vp-truncated">⚠ Showing first 20,000 values — use text filter for more</div>
+        )}
 
         <div className="vp-search-wrap">
           <input

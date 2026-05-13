@@ -1,6 +1,7 @@
 import { useRef, useState, useCallback, useEffect, useMemo } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import ColumnValuePicker from './ColumnValuePicker'
+import { cellFormattingStyle } from './FormattingPanel'
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 const _dateRx = /^(\d{4})-(\d{2})-(\d{2})$/
@@ -25,7 +26,15 @@ function fmtAmount(val) {
   return isNaN(n) ? val : _numFmt.format(n)
 }
 
+// Explicit per-column formatters. Date format applies ONLY to columns
+// whose name suggests a date — no longer applied globally to all cells.
 const COL_FORMATTERS = { Amount: fmtAmount, RATE: fmtAmount, 'RAP RTE': fmtAmount, 'RAP DIS': fmtFixed2 }
+const DATE_COL_RX = /date|dt$|^dt|day|time/i
+
+function defaultFormatter(col) {
+  return COL_FORMATTERS[col] ?? (DATE_COL_RX.test(col) ? fmtDate : (v) => v)
+}
+
 const _statFmt = new Intl.NumberFormat('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
 
 const ROW_HEIGHT = 32
@@ -39,27 +48,28 @@ export default function Grid({
   rows, sortCol, sortDir, onSort,
   columnFilters, onColumnFilter,
   valueFilters, onValueFilter, getDistinctValues,
+  formattingRules, // [{column_name, rule}]
+  totalCount,
 }) {
   const displayColumns = (columnOrder && columnOrder.length === columns.length) ? columnOrder : columns
   const parentRef = useRef(null)
   const gridRef = useRef(null)
 
-  const [selected, setSelected] = useState(null)  // { rowIdx, colIdx } — cursor/focus cell
-  const [anchor,   setAnchor]   = useState(null)  // { rowIdx, colIdx } — range start (Shift+Arrow)
+  const [selected, setSelected] = useState(null)
+  const [anchor,   setAnchor]   = useState(null)
 
-  // Value picker state
-  const [picker, setPicker] = useState(null)  // { col, anchorRect, allValues }
+  const [picker, setPicker] = useState(null)
   const pickerActiveRef = useRef(false)
+  const openPickerRef = useRef(null)
 
-  // Column drag-reorder state
   const [dragCol, setDragCol] = useState(null)
   const [dragOverCol, setDragOverCol] = useState(null)
 
-  // Column resize state
   const [colWidths, setColWidths] = useState(() => {
     try { return JSON.parse(localStorage.getItem('col-widths') || '{}') } catch { return {} }
   })
   const [resizingCol, setResizingCol] = useState(null)
+  const resizeCleanupRef = useRef(null)
 
   const getColWidth = useCallback((col) => colWidths[col] ?? COL_WIDTH, [colWidths])
 
@@ -80,10 +90,19 @@ export default function Grid({
       document.body.classList.remove('resizing-col')
       setResizingCol(null)
       setColWidths(prev => { localStorage.setItem('col-widths', JSON.stringify(prev)); return prev })
+      resizeCleanupRef.current = null
     }
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
+    resizeCleanupRef.current = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('resizing-col')
+    }
   }, [getColWidth])
+
+  // Cleanup any resize listeners on unmount
+  useEffect(() => () => { resizeCleanupRef.current?.() }, [])
 
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
@@ -92,15 +111,33 @@ export default function Grid({
     overscan: 5,
   })
 
-  // Clear selection when rows change (search / filter / sort)
+  // Only clear selection if column set changes (not on every row refresh).
+  // This preserves selection across filter/search keystrokes.
+  const colSig = columns.join('\x1f')
   useEffect(() => {
     setSelected(null)
     setAnchor(null)
-  }, [rows])
+  }, [colSig])
+
+  // Compute per-column min/max for heatmap formatting (numeric cols only)
+  const heatmapStats = useMemo(() => {
+    const map = new Map()
+    if (!formattingRules?.some(r => r.rule?.kind === 'heatmap')) return map
+    const heatCols = new Set(formattingRules.filter(r => r.rule?.kind === 'heatmap').map(r => r.column_name))
+    for (const col of heatCols) {
+      const idx = columns.indexOf(col)
+      if (idx < 0) continue
+      let min = Infinity, max = -Infinity, any = false
+      for (const row of rows) {
+        const n = parseFloat(row[idx + 1])
+        if (!isNaN(n)) { any = true; if (n < min) min = n; if (n > max) max = n }
+      }
+      if (any) map.set(col, { min, max })
+    }
+    return map
+  }, [formattingRules, rows, columns])
 
   // ── helpers ──────────────────────────────────────────────────────────────────
-
-  const focusGrid = () => setTimeout(() => gridRef.current?.focus(), 0)
 
   const scrollTo = (rowIdx, align = 'auto') =>
     rowVirtualizer.scrollToIndex(rowIdx, { align })
@@ -118,7 +155,6 @@ export default function Grid({
     }
   }
 
-
   // ── keyboard: grid-level (when not editing) ───────────────────────────────
 
   const handleGridKeyDown = useCallback((e) => {
@@ -128,7 +164,6 @@ export default function Grid({
     const maxRow = rows.length - 1
     const maxCol = columns.length - 1
 
-    // Move cursor; if shift held, keep anchor fixed (range selection); else anchor = cursor
     const moveTo = (r, c, alignV = 'auto') => {
       const nr = Math.max(0, Math.min(maxRow, r))
       const nc = Math.max(0, Math.min(maxCol, c))
@@ -136,6 +171,40 @@ export default function Grid({
       if (!e.shiftKey) setAnchor({ rowIdx: nr, colIdx: nc })
       scrollTo(nr, alignV)
       scrollColIntoView(nc)
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+      e.preventDefault()
+      setAnchor({ rowIdx: 0, colIdx: 0 })
+      setSelected({ rowIdx: rows.length - 1, colIdx: columns.length - 1 })
+      return
+    }
+
+    if (e.key === 'PageDown') {
+      e.preventDefault()
+      const pageRows = Math.floor((parentRef.current?.clientHeight ?? 400) / ROW_HEIGHT)
+      moveTo(Math.min(rows.length - 1, rowIdx + pageRows), colIdx, 'auto')
+      return
+    }
+    if (e.key === 'PageUp') {
+      e.preventDefault()
+      const pageRows = Math.floor((parentRef.current?.clientHeight ?? 400) / ROW_HEIGHT)
+      moveTo(Math.max(0, rowIdx - pageRows), colIdx, 'auto')
+      return
+    }
+
+    if (e.altKey && e.key === 'ArrowDown') {
+      e.preventDefault()
+      const col = columns[colIdx]
+      if (col && openPickerRef.current) {
+        const filterInput = parentRef.current?.querySelector(
+          `.filter-cell:nth-child(${colIdx + 2}) .filter-input`
+        )
+        const anchor = filterInput ?? gridRef.current
+        const fakeE = { stopPropagation: () => {}, currentTarget: { getBoundingClientRect: () => anchor?.getBoundingClientRect() ?? { left: 100, bottom: 100, top: 100 } } }
+        openPickerRef.current(col, fakeE)
+      }
+      return
     }
 
     switch (e.key) {
@@ -166,6 +235,10 @@ export default function Grid({
         moveTo((e.ctrlKey || e.metaKey) ? maxRow : rowIdx, maxCol, 'end')
         break
       case 'Tab':
+        // Only intercept Tab when shift+arrow-style intra-grid nav is intended.
+        // Plain Tab escapes the grid to the next focusable page element.
+        if (!e.shiftKey && colIdx === maxCol && rowIdx === maxRow) return // let Tab leave
+        if (e.shiftKey && colIdx === 0 && rowIdx === 0) return // let Shift+Tab leave
         e.preventDefault()
         if (e.shiftKey) {
           if (colIdx > 0) moveTo(rowIdx, colIdx - 1)
@@ -203,13 +276,15 @@ export default function Grid({
   // ── value picker ─────────────────────────────────────────────────────────
 
   const openPicker = useCallback(async (col, e) => {
-    e.stopPropagation()  // don't trigger sort
+    e.stopPropagation()
     const rect = e.currentTarget.getBoundingClientRect()
     pickerActiveRef.current = true
-    setPicker({ col, anchorRect: rect, allValues: [] })
-    const allValues = getDistinctValues ? await getDistinctValues(col) : []
-    setPicker({ col, anchorRect: rect, allValues })
+    setPicker({ col, anchorRect: rect, allValues: [], truncated: false })
+    const result = getDistinctValues ? await getDistinctValues(col) : { values: [], truncated: false }
+    const { values = [], truncated = false } = result && typeof result === 'object' && !Array.isArray(result) ? result : { values: result ?? [], truncated: false }
+    setPicker(p => p && p.col === col ? { col, anchorRect: rect, allValues: values, truncated } : p)
   }, [getDistinctValues])
+  openPickerRef.current = openPicker
 
   const closePicker = useCallback(() => {
     pickerActiveRef.current = false
@@ -227,7 +302,6 @@ export default function Grid({
     (columnFilters && Object.keys(columnFilters).some(k => columnFilters[k])) ||
     (valueFilters && Object.keys(valueFilters).length > 0)
 
-  // Range selection bounds
   const rangeMinRow = (anchor && selected) ? Math.min(anchor.rowIdx, selected.rowIdx) : -1
   const rangeMaxRow = (anchor && selected) ? Math.max(anchor.rowIdx, selected.rowIdx) : -1
   const rangeMinCol = (anchor && selected) ? Math.min(anchor.colIdx, selected.colIdx) : -1
@@ -235,7 +309,7 @@ export default function Grid({
   const hasRange    = rangeMinRow !== rangeMaxRow || rangeMinCol !== rangeMaxCol
   const inRange = (r, c) => r >= rangeMinRow && r <= rangeMaxRow && c >= rangeMinCol && c <= rangeMaxCol
 
-  // Footer selection stats (Average / Count / Sum)
+  // Expanded selection stats: Avg, Count, Sum, Min, Max, Median, StdDev
   const selectionStats = useMemo(() => {
     if (!selected) return null
     const minR = hasRange ? rangeMinRow : selected.rowIdx
@@ -243,8 +317,10 @@ export default function Grid({
     const minC = hasRange ? rangeMinCol : selected.colIdx
     const maxC = hasRange ? rangeMaxCol : selected.colIdx
     const cellCount = (maxR - minR + 1) * (maxC - minC + 1)
-    if (cellCount > 100_000) return null  // too large to compute
-    let count = 0, numCount = 0, sum = 0
+    if (cellCount > 100_000) return null
+    let count = 0
+    const nums = []
+    let sum = 0, min = Infinity, max = -Infinity
     for (let r = minR; r <= maxR; r++) {
       const row = rows[r]
       if (!row) continue
@@ -254,32 +330,43 @@ export default function Grid({
         if (val !== '' && val != null) {
           count++
           const n = parseFloat(val)
-          if (!isNaN(n)) { numCount++; sum += n }
+          if (!isNaN(n)) {
+            nums.push(n); sum += n
+            if (n < min) min = n
+            if (n > max) max = n
+          }
         }
       }
     }
-    return { count, numCount, sum, avg: numCount > 0 ? sum / numCount : null }
+    const numCount = nums.length
+    if (numCount === 0) return { count, numCount: 0, sum: 0, avg: null, min: null, max: null, median: null, stddev: null }
+    const avg = sum / numCount
+    // Median
+    const sorted = [...nums].sort((a, b) => a - b)
+    const median = numCount % 2 === 1 ? sorted[numCount >> 1] : (sorted[numCount/2 - 1] + sorted[numCount/2]) / 2
+    // StdDev (population)
+    let sse = 0; for (const n of nums) sse += (n - avg) ** 2
+    const stddev = Math.sqrt(sse / numCount)
+    return { count, numCount, sum, avg, min, max, median, stddev }
   }, [selected, rows, columns, displayColumns, hasRange, rangeMinRow, rangeMaxRow, rangeMinCol, rangeMaxCol])
 
   return (
     <div className="grid-wrap">
-      {/* Keyboard nav hint bar */}
       {selected && (
         <div className="kbd-hint">
           <kbd>↑↓←→</kbd> navigate &nbsp;·&nbsp;
           <kbd>Shift+↑↓←→</kbd> select range &nbsp;·&nbsp;
           <kbd>Ctrl+↑↓</kbd> first/last row &nbsp;·&nbsp;
-          <kbd>Ctrl+Home</kbd><kbd>Ctrl+End</kbd> first/last cell
+          <kbd>Alt+↓</kbd> open filter &nbsp;·&nbsp;
+          <kbd>?</kbd> all shortcuts
         </div>
       )}
 
-      {/* Scrollable grid */}
       <div
         ref={parentRef}
         className="grid-scroll"
         style={{ '--total-width': `${totalWidth}px` }}
       >
-        {/* Sticky header group */}
         <div className="grid-header-group" style={{ width: totalWidth }}>
           <div className="grid-header" style={{ height: HEADER_HEIGHT }}>
             <div className="cell rn-cell" style={{ width: ROW_NUM_WIDTH }}>#</div>
@@ -315,6 +402,7 @@ export default function Grid({
                     className={`col-filter-btn${hasValueFilter ? ' col-filter-btn--active' : ''}`}
                     onClick={(e) => openPicker(col, e)}
                     title={`Filter ${col}`}
+                    aria-label={`Filter ${col}`}
                   >
                     <svg width="9" height="9" viewBox="0 0 24 24" fill={hasValueFilter ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2.5">
                       <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
@@ -347,6 +435,12 @@ export default function Grid({
                   placeholder="Filter…"
                   value={columnFilters?.[col] ?? ''}
                   onChange={(e) => onColumnFilter(col, e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.altKey && e.key === 'ArrowDown') {
+                      e.preventDefault()
+                      openPicker(col, { stopPropagation: () => {}, currentTarget: e.currentTarget })
+                    }
+                  }}
                 />
                 {columnFilters?.[col] && (
                   <button className="filter-clear-btn" onClick={() => onColumnFilter(col, '')}>✕</button>
@@ -356,12 +450,13 @@ export default function Grid({
           </div>
         </div>
 
-        {/* Focusable virtual body — captures arrow keys */}
         <div
           ref={gridRef}
           className="grid-body"
           style={{ height: rowVirtualizer.getTotalSize(), width: totalWidth }}
           tabIndex={0}
+          role="grid"
+          aria-label="Data grid"
           onKeyDown={handleGridKeyDown}
           onBlur={(e) => {
             if (!e.currentTarget.contains(e.relatedTarget)) setSelected(null)
@@ -386,12 +481,13 @@ export default function Grid({
                   const isSel      = selected?.rowIdx === vRow.index && selected?.colIdx === colIdx
                   const isFiltered = !!columnFilters?.[col]
                   const isInRange  = hasRange && inRange(vRow.index, colIdx)
+                  const fmtStyle   = cellFormattingStyle(col, cellVal, formattingRules, heatmapStats)
 
                   return (
                     <div
                       key={col}
                       className={`cell data-cell${isSel ? ' selected-cell' : ''}${isInRange ? ' range-cell' : ''}${isFiltered ? ' filtered-col' : ''}`}
-                      style={{ width: getColWidth(col) }}
+                      style={{ width: getColWidth(col), ...(fmtStyle ?? {}) }}
                       onClick={(e) => {
                         const ri = vRow.index
                         if (e.shiftKey && anchor) {
@@ -403,7 +499,7 @@ export default function Grid({
                         gridRef.current?.focus()
                       }}
                     >
-                      <span className="cell-text">{(COL_FORMATTERS[col] ?? fmtDate)(cellVal)}</span>
+                      <span className="cell-text">{defaultFormatter(col)(cellVal)}</span>
                     </div>
                   )
                 })}
@@ -414,7 +510,13 @@ export default function Grid({
       </div>
 
       <div className="grid-footer">
-        {rows.length.toLocaleString()} row{rows.length !== 1 ? 's' : ''}
+        {totalCount > rows.length ? (
+          <span className="footer-cap-warn">
+            ⚠ Showing {rows.length.toLocaleString()} of {totalCount.toLocaleString()} rows — apply filters to narrow results
+          </span>
+        ) : (
+          <span>{rows.length.toLocaleString()} row{rows.length !== 1 ? 's' : ''}</span>
+        )}
         {hasActiveFilters && <span className="footer-filter-note"> (filtered)</span>}
         {selected && !hasRange && (
           <span className="footer-cell-ref">
@@ -428,12 +530,20 @@ export default function Grid({
         )}
         {selectionStats && selectionStats.count > 0 && (
           <span className="footer-selection-stats">
-            {selectionStats.numCount > 1 && (
-              <span className="footer-stat">Average: {_statFmt.format(selectionStats.avg)}</span>
-            )}
             <span className="footer-stat">Count: {selectionStats.count.toLocaleString()}</span>
             {selectionStats.numCount > 0 && (
-              <span className="footer-stat">Sum: {_statFmt.format(selectionStats.sum)}</span>
+              <>
+                <span className="footer-stat">Sum: {_statFmt.format(selectionStats.sum)}</span>
+                <span className="footer-stat">Avg: {_statFmt.format(selectionStats.avg)}</span>
+                <span className="footer-stat">Min: {_statFmt.format(selectionStats.min)}</span>
+                <span className="footer-stat">Max: {_statFmt.format(selectionStats.max)}</span>
+                {selectionStats.numCount > 1 && (
+                  <>
+                    <span className="footer-stat">Median: {_statFmt.format(selectionStats.median)}</span>
+                    <span className="footer-stat">σ: {_statFmt.format(selectionStats.stddev)}</span>
+                  </>
+                )}
+              </>
             )}
           </span>
         )}
@@ -444,6 +554,7 @@ export default function Grid({
           col={picker.col}
           anchorRect={picker.anchorRect}
           allValues={picker.allValues}
+          truncated={picker.truncated}
           activeValues={valueFilters?.[picker.col] ?? null}
           onApply={handlePickerApply}
           onClose={closePicker}

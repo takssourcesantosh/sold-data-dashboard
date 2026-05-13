@@ -1,19 +1,5 @@
 import { useState, useEffect, useCallback, useRef, Component } from 'react'
-
-class ErrorBoundary extends Component {
-  state = { error: null }
-  static getDerivedStateFromError(e) { return { error: e } }
-  render() {
-    if (this.state.error) return (
-      <div style={{ padding: 32, fontFamily: 'monospace', color: 'red', background: '#fff', position: 'fixed', inset: 0, zIndex: 9999, overflow: 'auto' }}>
-        <h2>App Error (send this to developer):</h2>
-        <pre>{this.state.error?.message}</pre>
-        <pre>{this.state.error?.stack}</pre>
-      </div>
-    )
-    return this.props.children
-  }
-}
+import { ToastProvider, useToast, useConfirm } from './components/Toast'
 import {
   initDb,
   queryRows,
@@ -24,11 +10,13 @@ import {
   getDistinctValues,
   listBackups,
   restoreBackup,
+  pinBackupApi,
   getMyProfile,
-  loginApi,
   logoutApi,
   getStoredUser,
   setStoredUser,
+  listFormattingApi,
+  onBroadcast,
 } from './api'
 import Grid from './components/Grid'
 import Toolbar from './components/Toolbar'
@@ -38,25 +26,68 @@ import BackupPanel from './components/BackupPanel'
 import ProfilePanel from './components/ProfilePanel'
 import UserManagementPanel from './components/UserManagementPanel'
 import LoginScreen from './components/LoginScreen'
+import ShortcutsPanel from './components/ShortcutsPanel'
+import ViewsPanel from './components/ViewsPanel'
+import AlertsPanel from './components/AlertsPanel'
+import FormattingPanel from './components/FormattingPanel'
+import DiffPanel from './components/DiffPanel'
+import PivotPanel from './components/PivotPanel'
+import { getRecentSearches, addRecentSearch, readViewFromUrl, clearViewHash, buildShareUrl } from './lib/view-state'
+
+class ErrorBoundary extends Component {
+  state = { error: null }
+  static getDerivedStateFromError(e) { return { error: e } }
+  render() {
+    if (this.state.error) return (
+      <div style={{ padding: 32, fontFamily: 'monospace', color: 'red', background: '#fff', position: 'fixed', inset: 0, zIndex: 9999, overflow: 'auto' }}>
+        <h2>App Error (send this to developer):</h2>
+        <pre>{this.state.error?.message}</pre>
+        <pre>{this.state.error?.stack}</pre>
+        <button onClick={() => location.reload()}>Reload</button>
+      </div>
+    )
+    return this.props.children
+  }
+}
 
 // ── Auth wrapper ──────────────────────────────────────────────────────────────
 
 export default function App() {
+  return (
+    <ToastProvider>
+      <ErrorBoundary>
+        <AppInner />
+      </ErrorBoundary>
+    </ToastProvider>
+  )
+}
+
+function AppInner() {
   const [currentUser, setCurrentUser] = useState(() => getStoredUser())
 
   const handleLogin = (user) => setCurrentUser(user)
-  const handleLogout = () => {
-    logoutApi()
+  const handleLogout = async () => {
+    await logoutApi()
     setCurrentUser(null)
   }
 
+  // Listen for cross-tab logout
+  useEffect(() => {
+    const off = onBroadcast((msg) => {
+      if (msg.type === 'auth.logout') setCurrentUser(null)
+    })
+    return off
+  }, [])
+
   if (!currentUser) return <LoginScreen onLogin={handleLogin} />
-  return <ErrorBoundary><Dashboard currentUser={currentUser} onLogout={handleLogout} /></ErrorBoundary>
+  return <Dashboard currentUser={currentUser} onLogout={handleLogout} />
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
 function Dashboard({ currentUser: initialUser, onLogout }) {
+  const toast = useToast()
+  const [askConfirm, ConfirmModal] = useConfirm()
   const [currentUser, setCurrentUser] = useState(initialUser)
   const isAdmin = currentUser.role === 'admin'
 
@@ -65,6 +96,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   const [loadPct, setLoadPct] = useState(null)
   const [columns, setColumns] = useState([])
   const [rows, setRows] = useState([])
+  const [totalCount, setTotalCount] = useState(0)
   const [search, setSearch] = useState('')
   const [sortCol, setSortCol] = useState(null)
   const [sortDir, setSortDir] = useState('asc')
@@ -77,6 +109,15 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   const [backupPanelOpen, setBackupPanelOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const [userMgmtOpen, setUserMgmtOpen] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const [viewsOpen, setViewsOpen] = useState(false)
+  const [alertsOpen, setAlertsOpen] = useState(false)
+  const [formattingOpen, setFormattingOpen] = useState(false)
+  const [diffOpen, setDiffOpen] = useState(false)
+  const [pivotOpen, setPivotOpen] = useState(false)
+  const [recentOpen, setRecentOpen] = useState(false)
+  const [recentSearches, setRecentSearches] = useState(() => getRecentSearches())
+  const [formattingRules, setFormattingRules] = useState([])
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'dark')
   const [columnOrder, setColumnOrder] = useState([])
   const prevColSigRef = useRef('')
@@ -89,7 +130,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   const stateRef = useRef({ search: '', sortCol: null, sortDir: 'asc', columnFilters: {}, valueFilters: {}, advancedFilters: [] })
 
   useEffect(() => {
-    const sig = columns.join('|')
+    const sig = JSON.stringify(columns)
     if (sig === prevColSigRef.current) return
     prevColSigRef.current = sig
     if (columns.length === 0) { setColumnOrder([]); return }
@@ -120,44 +161,110 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
 
   const loadBackups = useCallback(async () => {
     if (!isAdmin) return
-    try { setBackups(await listBackups()) } catch {}
+    try { setBackups(await listBackups()) } catch (e) { console.error('loadBackups:', e) }
   }, [isAdmin])
+
+  const loadFormatting = useCallback(async () => {
+    try { setFormattingRules(await listFormattingApi()) } catch (e) { console.error('loadFormatting:', e) }
+  }, [])
 
   const loadData = useCallback(async () => {
     try {
-      const { columns: cols, rows: r } = await queryRows(stateRef.current)
+      const { columns: cols, rows: r, totalCount: tc } = await queryRows(stateRef.current)
       setColumns(cols)
       setRows(r)
+      setTotalCount(tc ?? r.length)
     } catch (err) {
       console.error('loadData failed:', err)
-      if (err.message === 'Unauthorized' || err.message === 'Invalid token') {
-        logoutApi()
+      if (err.message === 'Unauthorized' || err.message === 'Invalid token' || err.message?.includes('Session revoked')) {
+        await logoutApi()
         window.location.reload()
+      } else {
+        toast.error('Failed to load data: ' + err.message)
       }
     }
-  }, [])
+  }, []) // eslint-disable-line
+
+  // Apply a view payload (from saved view, share link, etc.)
+  const applyView = useCallback((payload) => {
+    if (!payload) return
+    const next = {
+      search: payload.search ?? '',
+      sortCol: payload.sortCol ?? null,
+      sortDir: payload.sortDir ?? 'asc',
+      columnFilters: payload.columnFilters ?? {},
+      valueFilters: payload.valueFilters ?? {},
+      advancedFilters: payload.advancedFilters ?? [],
+    }
+    stateRef.current = next
+    setSearch(next.search)
+    setSortCol(next.sortCol)
+    setSortDir(next.sortDir)
+    setColumnFilters(next.columnFilters)
+    setValueFilters(next.valueFilters)
+    setAdvancedFilters(next.advancedFilters)
+    if (payload.columnOrder) setColumnOrder(payload.columnOrder)
+    loadData()
+  }, [loadData])
 
   useEffect(() => {
     async function boot() {
       try {
         setLoadingMsg('Connecting…')
         await initDb()
-          const profile = await getMyProfile()
+        const profile = await getMyProfile()
         setCurrentUser(u => ({ ...u, ...profile }))
         setDbReady(true)
-        loadData()
+
+        if (profile.must_change_password) {
+          toast.warn('Please change your password before continuing.', { ttl: 0 })
+          setProfileOpen(true)
+        }
+
+        // Load formatting rules
+        loadFormatting()
+
+        // Share-by-link: if URL hash has view, apply it
+        const urlView = readViewFromUrl()
+        if (urlView) {
+          applyView(urlView)
+          clearViewHash()
+          toast.info('View loaded from shared link')
+        } else {
+          loadData()
+        }
+
         loadBackups()
       } catch (err) {
-        if (err.message === 'Unauthorized' || err.message === 'Invalid token') {
-          logoutApi()
+        if (err.message === 'Unauthorized' || err.message === 'Invalid token' || err.message?.includes('Session revoked')) {
+          await logoutApi()
           window.location.reload()
         } else {
-          setLoadingMsg('Connection failed. Please refresh.')
+          setLoadingMsg('Connection failed: ' + err.message)
         }
       }
     }
     boot()
-  }, [loadData])
+  }, [loadData, loadBackups, loadFormatting, applyView]) // eslint-disable-line
+
+  // Multi-tab sync: react to cross-tab events
+  useEffect(() => {
+    const off = onBroadcast((msg) => {
+      if (!msg) return
+      switch (msg.type) {
+        case 'data.upload':
+        case 'data.append':
+        case 'data.restore':
+        case 'data.clear':
+          toast.info('Data changed in another tab. Refreshing…')
+          loadData()
+          loadBackups()
+          break
+        default: break
+      }
+    })
+    return off
+  }, [loadData, loadBackups]) // eslint-disable-line
 
   const searchTimer = useRef(null)
   const filterTimer = useRef(null)
@@ -174,6 +281,13 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     stateRef.current.search = text
     clearTimeout(searchTimer.current)
     searchTimer.current = setTimeout(loadData, 200)
+  }
+
+  const handleSearchCommit = (text) => {
+    if (text?.trim()) {
+      addRecentSearch(text.trim())
+      setRecentSearches(getRecentSearches())
+    }
   }
 
   const handleSort = (col) => {
@@ -220,15 +334,45 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     setColumnFilters({}); setValueFilters({}); setAdvancedFilters([])
   }
 
+  // Build current view payload for save / share
+  const currentViewPayload = () => ({
+    search: stateRef.current.search,
+    sortCol: stateRef.current.sortCol,
+    sortDir: stateRef.current.sortDir,
+    columnFilters: stateRef.current.columnFilters,
+    valueFilters: stateRef.current.valueFilters,
+    advancedFilters: stateRef.current.advancedFilters,
+    columnOrder,
+  })
+
+  const handleShareCurrent = async () => {
+    const url = buildShareUrl(currentViewPayload())
+    try { await navigator.clipboard.writeText(url); toast.success('Share link copied') }
+    catch { toast.info(url) }
+  }
+
+  // Notify on triggered alerts (after upload/append)
+  const notifyTriggeredAlerts = (triggered) => {
+    if (!triggered?.length) return
+    for (const a of triggered) {
+      const msg = `🔔 Alert "${a.name}" triggered: ${a.count} rows match ${a.column_name} ${a.op} ${a.threshold}`
+      toast.warn(msg, { ttl: 9000 })
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        try { new Notification('Belgium Diamonds — Alert', { body: msg }) } catch {}
+      }
+    }
+  }
+
   const handleUpload = async (file) => {
     setLoadPct(0)
     try {
-      await createTableFromCSV(file, (pct) => setLoadPct(pct))
+      const data = await createTableFromCSV(file, (pct) => setLoadPct(pct))
       resetQueryState()
       loadData()
       loadBackups()
+      notifyTriggeredAlerts(data?.triggeredAlerts)
     } catch (err) {
-      alert('Upload failed: ' + err.message)
+      toast.error('Upload failed: ' + err.message)
     } finally {
       setLoadPct(null)
     }
@@ -236,19 +380,26 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
 
   const handleAppend = async (file) => {
     try {
-      await appendFromCSV(file)
+      const data = await appendFromCSV(file)
       loadData()
+      notifyTriggeredAlerts(data?.triggeredAlerts)
     } catch (err) {
-      alert(err.message)
+      toast.error(err.message)
     }
   }
 
   const handleClearData = async () => {
-    await clearAllData()
-    resetQueryState()
-    setColumns([])
-    setRows([])
-    loadBackups()
+    if (!(await askConfirm('Delete all data? Current data will be backed up first.', { danger: true, confirmLabel: 'Clear' }))) return
+    try {
+      await clearAllData()
+      resetQueryState()
+      setColumns([])
+      setRows([])
+      loadBackups()
+      toast.success('Data cleared')
+    } catch (err) {
+      toast.error(err.message)
+    }
   }
 
   const handleRestore = async (slot) => {
@@ -259,14 +410,69 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
       resetQueryState()
       loadData()
       loadBackups()
+      toast.success('Restored')
     } catch (err) {
-      alert('Restore failed: ' + err.message)
+      toast.error('Restore failed: ' + err.message)
     } finally {
       setLoadPct(null)
     }
   }
 
-  const handleExport = () => exportCsvAndDownload()
+  const handleExport = () => exportCsvAndDownload({
+    search: stateRef.current.search,
+    sortCol: stateRef.current.sortCol,
+    sortDir: stateRef.current.sortDir,
+    columnFilters: stateRef.current.columnFilters,
+    valueFilters: stateRef.current.valueFilters,
+    advancedFilters: stateRef.current.advancedFilters,
+  }).catch(err => toast.error(err.message))
+
+  const hasData = columns.length > 0
+
+  // ── Global keyboard shortcuts ─────────────────────────────────────────────
+  useEffect(() => {
+    const handler = (e) => {
+      const tag = document.activeElement?.tagName
+      const inInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault()
+        document.querySelector('.search-input')?.focus()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'e' && !e.shiftKey && hasData) {
+        e.preventDefault()
+        handleExport()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+        e.preventDefault()
+        clearFilters()
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+        e.preventDefault()
+        setAdvancedOpen(o => !o)
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'S' || e.key === 's')) {
+        e.preventDefault()
+        setViewsOpen(true)
+        return
+      }
+      if (e.key === 'Escape' && document.activeElement?.classList.contains('search-input')) {
+        handleSearch('')
+        document.activeElement.blur()
+        return
+      }
+      if (e.key === '?' && !inInput) {
+        setShortcutsOpen(o => !o)
+        return
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [hasData]) // eslint-disable-line
 
   useEffect(() => {
     if (!isAdmin) return
@@ -304,8 +510,6 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     )
   }
 
-  const hasData = columns.length > 0
-
   return (
     <div className="app">
       {loadPct !== null && (
@@ -315,6 +519,11 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
       <Toolbar
         search={search}
         onSearch={handleSearch}
+        onSearchCommit={handleSearchCommit}
+        recentSearches={recentSearches}
+        recentOpen={recentOpen}
+        onToggleRecent={() => setRecentOpen(o => !o)}
+        onPickRecent={(q) => { handleSearch(q); setRecentOpen(false) }}
         onUpload={handleUpload}
         onAppend={handleAppend}
         onClearData={handleClearData}
@@ -334,6 +543,13 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         onOpenBackups={() => setBackupPanelOpen(true)}
         onOpenProfile={() => setProfileOpen(true)}
         onOpenUserMgmt={() => setUserMgmtOpen(true)}
+        onOpenShortcuts={() => setShortcutsOpen(true)}
+        onOpenViews={() => setViewsOpen(true)}
+        onOpenAlerts={() => setAlertsOpen(true)}
+        onOpenFormatting={() => setFormattingOpen(true)}
+        onOpenDiff={() => setDiffOpen(true)}
+        onOpenPivot={() => setPivotOpen(true)}
+        onShareCurrent={handleShareCurrent}
       />
 
       <AdvancedFilterPanel
@@ -357,11 +573,11 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
           valueFilters={valueFilters}
           onValueFilter={handleValueFilter}
           getDistinctValues={getColDistinctValues}
+          formattingRules={formattingRules}
+          totalCount={totalCount}
         />
       ) : (
-        isAdmin
-          ? <EmptyState onUpload={handleUpload} />
-          : <EmptyStateReadOnly />
+        isAdmin ? <EmptyState onUpload={handleUpload} /> : <EmptyStateReadOnly />
       )}
 
       {dragging && isAdmin && (
@@ -372,6 +588,10 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         <BackupPanel
           backups={backups}
           onRestore={handleRestore}
+          onPin={async (slot, pinned) => {
+            try { await pinBackupApi(slot, pinned); loadBackups() }
+            catch (e) { toast.error(e.message) }
+          }}
           onClose={() => setBackupPanelOpen(false)}
         />
       )}
@@ -380,10 +600,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         <ProfilePanel
           currentUser={currentUser}
           onClose={() => setProfileOpen(false)}
-          onProfileUpdate={(updated) => {
-            setCurrentUser(updated)
-            setStoredUser(updated)
-          }}
+          onProfileUpdate={(updated) => { setCurrentUser(updated); setStoredUser(updated) }}
         />
       )}
 
@@ -393,6 +610,34 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
           onClose={() => setUserMgmtOpen(false)}
         />
       )}
+
+      {shortcutsOpen && <ShortcutsPanel onClose={() => setShortcutsOpen(false)} />}
+
+      {viewsOpen && (
+        <ViewsPanel
+          currentUserId={currentUser.id}
+          currentPayload={currentViewPayload()}
+          onApply={applyView}
+          onClose={() => setViewsOpen(false)}
+        />
+      )}
+
+      {alertsOpen && (
+        <AlertsPanel columns={columns} onClose={() => setAlertsOpen(false)} />
+      )}
+
+      {formattingOpen && (
+        <FormattingPanel
+          columns={columns}
+          onClose={() => setFormattingOpen(false)}
+          onApplied={loadFormatting}
+        />
+      )}
+
+      {diffOpen && <DiffPanel onClose={() => setDiffOpen(false)} />}
+      {pivotOpen && hasData && <PivotPanel columns={columns} onClose={() => setPivotOpen(false)} />}
+
+      {ConfirmModal}
     </div>
   )
 }
