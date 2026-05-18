@@ -7,6 +7,8 @@ import {
   appendFromCSV,
   clearAllData,
   exportCsvAndDownload,
+  exportXlsxAndDownload,
+  columnStatsApi,
   getDistinctValues,
   listBackups,
   restoreBackup,
@@ -32,6 +34,7 @@ import AlertsPanel from './components/AlertsPanel'
 import FormattingPanel from './components/FormattingPanel'
 import DiffPanel from './components/DiffPanel'
 import PivotPanel from './components/PivotPanel'
+import ColumnStatsPanel from './components/ColumnStatsPanel'
 import { getRecentSearches, addRecentSearch, readViewFromUrl, clearViewHash, buildShareUrl } from './lib/view-state'
 
 class ErrorBoundary extends Component {
@@ -121,13 +124,22 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'dark')
   const [columnOrder, setColumnOrder] = useState([])
   const prevColSigRef = useRef('')
+  const [hiddenColumns, setHiddenColumns] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('hidden-cols') || '[]') } catch { return [] }
+  })
+  const [frozenCount, setFrozenCount] = useState(() => {
+    return parseInt(localStorage.getItem('frozen-count') || '0', 10)
+  })
+  const [dateFilters, setDateFilters] = useState({})
+  const [sortSpec, setSortSpec] = useState([])
+  const [statsCol, setStatsCol] = useState(null)
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
     localStorage.setItem('theme', theme)
   }, [theme])
 
-  const stateRef = useRef({ search: '', sortCol: null, sortDir: 'asc', columnFilters: {}, valueFilters: {}, advancedFilters: [] })
+  const stateRef = useRef({ search: '', sortCol: null, sortDir: 'asc', columnFilters: {}, valueFilters: {}, advancedFilters: [], dateFilters: {}, sortSpec: [] })
 
   useEffect(() => {
     const sig = JSON.stringify(columns)
@@ -170,7 +182,11 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
 
   const loadData = useCallback(async () => {
     try {
-      const { columns: cols, rows: r, totalCount: tc } = await queryRows(stateRef.current)
+      const { columns: cols, rows: r, totalCount: tc } = await queryRows({
+        ...stateRef.current,
+        dateFilters: stateRef.current.dateFilters || {},
+        sortSpec: stateRef.current.sortSpec || [],
+      })
       setColumns(cols)
       setRows(r)
       setTotalCount(tc ?? r.length)
@@ -195,6 +211,8 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
       columnFilters: payload.columnFilters ?? {},
       valueFilters: payload.valueFilters ?? {},
       advancedFilters: payload.advancedFilters ?? [],
+      dateFilters: payload.dateFilters ?? {},
+      sortSpec: payload.sortSpec ?? [],
     }
     stateRef.current = next
     setSearch(next.search)
@@ -203,6 +221,8 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     setColumnFilters(next.columnFilters)
     setValueFilters(next.valueFilters)
     setAdvancedFilters(next.advancedFilters)
+    setDateFilters(next.dateFilters)
+    setSortSpec(next.sortSpec)
     if (payload.columnOrder) setColumnOrder(payload.columnOrder)
     loadData()
   }, [loadData])
@@ -215,6 +235,19 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         const profile = await getMyProfile()
         setCurrentUser(u => ({ ...u, ...profile }))
         setDbReady(true)
+
+        // JWT expiry warning
+        try {
+          const token = localStorage.getItem('bd-token')
+          if (token) {
+            const payload = JSON.parse(atob(token.split('.')[1]))
+            const expiresIn = payload.exp * 1000 - Date.now()
+            if (expiresIn < 24 * 60 * 60 * 1000) {
+              const hrs = Math.round(expiresIn / (60 * 60 * 1000))
+              toast.warn(`Session expires in ${hrs} hour${hrs !== 1 ? 's' : ''}. Log out and in again to renew.`, { ttl: 0 })
+            }
+          }
+        } catch {}
 
         if (profile.must_change_password) {
           toast.warn('Please change your password before continuing.', { ttl: 0 })
@@ -290,11 +323,39 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     }
   }
 
-  const handleSort = (col) => {
-    const newDir = stateRef.current.sortCol === col && stateRef.current.sortDir === 'asc' ? 'desc' : 'asc'
-    setSortCol(col); setSortDir(newDir)
-    stateRef.current.sortCol = col; stateRef.current.sortDir = newDir
-    loadData()
+  const handleSort = (col, event) => {
+    if (event?.ctrlKey || event?.metaKey) {
+      // Add/toggle as secondary sort
+      setSortSpec(prev => {
+        const existing = prev.find(s => s.col === col)
+        let next
+        if (existing) {
+          if (existing.dir === 'asc') next = prev.map(s => s.col === col ? { col, dir: 'desc' } : s)
+          else next = prev.filter(s => s.col !== col)
+        } else {
+          next = [...prev, { col, dir: 'asc' }]
+        }
+        stateRef.current.sortSpec = next
+        return next
+      })
+      loadData()
+    } else {
+      // Primary sort (old behavior) - clear multi-sort
+      const newDir = stateRef.current.sortCol === col && stateRef.current.sortDir === 'asc' ? 'desc' : 'asc'
+      setSortCol(col); setSortDir(newDir); setSortSpec([])
+      stateRef.current.sortCol = col; stateRef.current.sortDir = newDir; stateRef.current.sortSpec = []
+      loadData()
+    }
+  }
+
+  const handleDateFilter = (col, range) => {
+    const next = { ...stateRef.current.dateFilters }
+    if (!range || (!range.from && !range.to)) delete next[col]
+    else next[col] = range
+    setDateFilters(next)
+    stateRef.current.dateFilters = next
+    clearTimeout(filterTimer.current)
+    filterTimer.current = setTimeout(loadData, 250)
   }
 
   const handleColumnFilter = (col, val) => {
@@ -307,8 +368,8 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   }
 
   const clearFilters = () => {
-    setColumnFilters({}); setValueFilters({}); setAdvancedFilters([])
-    stateRef.current.columnFilters = {}; stateRef.current.valueFilters = {}; stateRef.current.advancedFilters = []
+    setColumnFilters({}); setValueFilters({}); setAdvancedFilters([]); setDateFilters({}); setSortSpec([])
+    stateRef.current = { ...stateRef.current, columnFilters: {}, valueFilters: {}, advancedFilters: [], dateFilters: {}, sortSpec: [] }
     loadData()
   }
 
@@ -329,9 +390,9 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   const getColDistinctValues = (col) => getDistinctValues(col)
 
   const resetQueryState = () => {
-    stateRef.current = { search: '', sortCol: null, sortDir: 'asc', columnFilters: {}, valueFilters: {}, advancedFilters: [] }
+    stateRef.current = { search: '', sortCol: null, sortDir: 'asc', columnFilters: {}, valueFilters: {}, advancedFilters: [], dateFilters: {}, sortSpec: [] }
     setSearch(''); setSortCol(null); setSortDir('asc')
-    setColumnFilters({}); setValueFilters({}); setAdvancedFilters([])
+    setColumnFilters({}); setValueFilters({}); setAdvancedFilters([]); setDateFilters({}); setSortSpec([])
   }
 
   // Build current view payload for save / share
@@ -342,8 +403,34 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     columnFilters: stateRef.current.columnFilters,
     valueFilters: stateRef.current.valueFilters,
     advancedFilters: stateRef.current.advancedFilters,
+    dateFilters: stateRef.current.dateFilters || {},
+    sortSpec: stateRef.current.sortSpec || [],
     columnOrder,
   })
+
+  const handleToggleColumn = (col) => {
+    setHiddenColumns(prev => {
+      const next = prev.includes(col) ? prev.filter(c => c !== col) : [...prev, col]
+      localStorage.setItem('hidden-cols', JSON.stringify(next))
+      return next
+    })
+  }
+
+  const handleShowAllColumns = () => {
+    setHiddenColumns([])
+    localStorage.removeItem('hidden-cols')
+  }
+
+  const handleSetFrozenCount = (n) => {
+    setFrozenCount(n)
+    localStorage.setItem('frozen-count', String(n))
+  }
+
+  const handleExportXlsx = () => exportXlsxAndDownload({
+    ...stateRef.current,
+    dateFilters: stateRef.current.dateFilters || {},
+    sortSpec: stateRef.current.sortSpec || [],
+  }).catch(err => toast.error(err.message))
 
   const handleShareCurrent = async () => {
     const url = buildShareUrl(currentViewPayload())
@@ -419,12 +506,9 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   }
 
   const handleExport = () => exportCsvAndDownload({
-    search: stateRef.current.search,
-    sortCol: stateRef.current.sortCol,
-    sortDir: stateRef.current.sortDir,
-    columnFilters: stateRef.current.columnFilters,
-    valueFilters: stateRef.current.valueFilters,
-    advancedFilters: stateRef.current.advancedFilters,
+    ...stateRef.current,
+    dateFilters: stateRef.current.dateFilters || {},
+    sortSpec: stateRef.current.sortSpec || [],
   }).catch(err => toast.error(err.message))
 
   const hasData = columns.length > 0
@@ -528,6 +612,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         onAppend={handleAppend}
         onClearData={handleClearData}
         onExport={handleExport}
+        onExportXlsx={handleExportXlsx}
         hasData={hasData}
         isAdmin={isAdmin}
         theme={theme}
@@ -550,6 +635,12 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         onOpenDiff={() => setDiffOpen(true)}
         onOpenPivot={() => setPivotOpen(true)}
         onShareCurrent={handleShareCurrent}
+        columns={columns}
+        hiddenColumns={hiddenColumns}
+        onToggleColumn={handleToggleColumn}
+        onShowAllColumns={handleShowAllColumns}
+        frozenCount={frozenCount}
+        onSetFrozenCount={handleSetFrozenCount}
       />
 
       <AdvancedFilterPanel
@@ -567,7 +658,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
           rows={rows}
           sortCol={sortCol}
           sortDir={sortDir}
-          onSort={handleSort}
+          onSort={(col, e) => handleSort(col, e)}
           columnFilters={columnFilters}
           onColumnFilter={handleColumnFilter}
           valueFilters={valueFilters}
@@ -575,6 +666,12 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
           getDistinctValues={getColDistinctValues}
           formattingRules={formattingRules}
           totalCount={totalCount}
+          hiddenColumns={hiddenColumns}
+          dateFilters={dateFilters}
+          onDateFilter={handleDateFilter}
+          frozenCount={frozenCount}
+          sortSpec={sortSpec}
+          onColumnStats={setStatsCol}
         />
       ) : (
         isAdmin ? <EmptyState onUpload={handleUpload} /> : <EmptyStateReadOnly />
@@ -636,6 +733,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
 
       {diffOpen && <DiffPanel onClose={() => setDiffOpen(false)} />}
       {pivotOpen && hasData && <PivotPanel columns={columns} onClose={() => setPivotOpen(false)} />}
+      {statsCol && <ColumnStatsPanel col={statsCol} onClose={() => setStatsCol(null)} />}
 
       {ConfirmModal}
     </div>

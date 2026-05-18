@@ -103,10 +103,40 @@ export default function PivotPanel({ columns, onClose }) {
           </div>
 
           <button className="btn-primary" onClick={compute} disabled={!valueCol}>Compute</button>
+          <button
+            className="btn"
+            disabled={!result}
+            onClick={() => {
+              if (!result) return
+              // Build CSV
+              const headers = [...result.rowDims, ...(result.colDim ? result.cols : [`${agg}(${valueCol})`])]
+              const csvRows = [headers.join(',')]
+              for (const r of result.rows) {
+                const cells = [
+                  ...r.keys.map(k => JSON.stringify(String(k ?? ''))),
+                  ...(result.colDim
+                    ? result.cols.map(c => r.values[c] == null ? '' : r.values[c])
+                    : [r.values._v == null ? '' : r.values._v]),
+                ]
+                csvRows.push(cells.join(','))
+              }
+              const blob = new Blob([csvRows.join('\n')], { type: 'text/csv' })
+              const url = URL.createObjectURL(blob)
+              const a = Object.assign(document.createElement('a'), { href: url, download: 'pivot.csv' })
+              a.click()
+              URL.revokeObjectURL(url)
+            }}
+            title="Download pivot as CSV"
+          >
+            Export CSV
+          </button>
         </div>
 
         <div className="pivot-result">
           {loading && <div className="vw-empty">Computing…</div>}
+          {!loading && result?.truncated && (
+            <div className="vp-truncated">⚠ Results truncated at 50,000 group combinations — add more row/column dimensions to narrow down</div>
+          )}
           {!loading && result && (
             <div className="pv-table-wrap">
               <table className="pv-table">

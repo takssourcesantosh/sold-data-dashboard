@@ -471,52 +471,34 @@ function buildAdvancedCondition(col, op, val, params) {
   }
 }
 
-export function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [], limit = 100_000, offset = 0 } = {}) {
+export function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [], dateFilters = {}, sortSpec = [], limit = 100_000, offset = 0 } = {}) {
   if (!tableExists()) return { columns: [], rows: [], totalCount: 0 }
 
   const columns = getColumns()
   if (!columns.length) return { columns: [], rows: [], totalCount: 0 }
 
   const selectCols = ['__id', ...columns.map(quoteCol)].join(', ')
-  const params = []
-  const conditions = []
 
-  if (search.trim()) {
-    const globalConds = columns.map(c => `${quoteCol(c)} LIKE ?`)
-    conditions.push(`(${globalConds.join(' OR ')})`)
-    columns.forEach(() => params.push(`%${search.trim()}%`))
-  }
-
-  for (const [col, val] of Object.entries(columnFilters)) {
-    if (val && val.trim() && columns.includes(col)) {
-      conditions.push(`${quoteCol(col)} LIKE ?`)
-      params.push(`%${val.trim()}%`)
-    }
-  }
-
-  for (const [col, vals] of Object.entries(valueFilters)) {
-    if (Array.isArray(vals) && vals.length > 0 && columns.includes(col)) {
-      const phs = vals.map(() => '?').join(', ')
-      conditions.push(`${quoteCol(col)} IN (${phs})`)
-      params.push(...vals)
-    }
-  }
-
-  for (const rule of advancedFilters) {
-    if (!rule.col || !columns.includes(rule.col)) continue
-    const NO_VAL = rule.op === 'is_empty' || rule.op === 'is_not_empty'
-    if (!NO_VAL && (!rule.val && rule.val !== 0)) continue
-    const cond = buildAdvancedCondition(rule.col, rule.op, rule.val, params)
-    if (cond) conditions.push(cond)
-  }
-
-  const whereSql = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
+  const { whereSql, params } = buildWhereClause(columns, { search, columnFilters, valueFilters, advancedFilters, dateFilters })
 
   // Count total matching rows
   const { c: totalCount } = db.prepare(`SELECT COUNT(*) AS c FROM "${TABLE}"${whereSql}`).get(...params)
 
   let sql = `SELECT ${selectCols} FROM "${TABLE}"${whereSql}`
-  if (sortCol && columns.includes(sortCol)) {
+
+  if (sortSpec && sortSpec.length > 0) {
+    // Multi-column sort via sortSpec
+    const orderParts = sortSpec
+      .filter(s => s.col && columns.includes(s.col))
+      .map(s => {
+        const numericish = /amount|rate|price|qty|count|total|sum|carat|rap|disc|num|number|weight/i.test(s.col)
+        const dir = s.dir === 'desc' ? 'DESC' : 'ASC'
+        return numericish
+          ? `CAST(${quoteCol(s.col)} AS REAL) ${dir}`
+          : `${quoteCol(s.col)} ${dir}`
+      })
+    if (orderParts.length) sql += ` ORDER BY ${orderParts.join(', ')}`
+  } else if (sortCol && columns.includes(sortCol)) {
     const numericish = /amount|rate|price|qty|count|total|sum|carat|rap|disc|num|number|weight/i.test(sortCol)
     if (numericish) {
       sql += ` ORDER BY CAST(${quoteCol(sortCol)} AS REAL) ${sortDir === 'desc' ? 'DESC' : 'ASC'}`
@@ -564,22 +546,12 @@ function csvEscapeCell(v) {
     : s
 }
 
-export function exportCsv() {
-  const { columns, rows } = queryRows()
-  if (!columns.length) return ''
-  return [
-    columns.map(csvEscapeCell).join(','),
-    ...rows.map(row => row.slice(1).map(csvEscapeCell).join(',')),
-  ].join('\n')
-}
-
-// Stream rows to a writable response. Avoids holding entire CSV in memory.
-export function streamCsvExport(res, filters = {}) {
-  if (!tableExists()) { res.end(''); return }
-  const columns = getColumns()
-  if (!columns.length) { res.end(''); return }
-
-  const { search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [] } = filters
+// Shared WHERE clause builder used by queryRows, streamCsvExport, and exportXlsx.
+// columns: string[] of valid column names in the table
+// filters: { search, columnFilters, valueFilters, advancedFilters, dateFilters }
+// dateFilters: { COL_NAME: { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' } }
+function buildWhereClause(columns, filters = {}) {
+  const { search = '', columnFilters = {}, valueFilters = {}, advancedFilters = [], dateFilters = {} } = filters
   const params = []
   const conditions = []
 
@@ -588,16 +560,22 @@ export function streamCsvExport(res, filters = {}) {
     conditions.push(`(${globalConds.join(' OR ')})`)
     columns.forEach(() => params.push(`%${search.trim()}%`))
   }
+
   for (const [col, val] of Object.entries(columnFilters)) {
     if (val && val.trim() && columns.includes(col)) {
-      conditions.push(`${quoteCol(col)} LIKE ?`); params.push(`%${val.trim()}%`)
+      conditions.push(`${quoteCol(col)} LIKE ?`)
+      params.push(`%${val.trim()}%`)
     }
   }
+
   for (const [col, vals] of Object.entries(valueFilters)) {
     if (Array.isArray(vals) && vals.length > 0 && columns.includes(col)) {
-      conditions.push(`${quoteCol(col)} IN (${vals.map(() => '?').join(',')})`); params.push(...vals)
+      const phs = vals.map(() => '?').join(', ')
+      conditions.push(`${quoteCol(col)} IN (${phs})`)
+      params.push(...vals)
     }
   }
+
   for (const rule of advancedFilters) {
     if (!rule.col || !columns.includes(rule.col)) continue
     const NO_VAL = rule.op === 'is_empty' || rule.op === 'is_not_empty'
@@ -606,7 +584,30 @@ export function streamCsvExport(res, filters = {}) {
     if (cond) conditions.push(cond)
   }
 
+  for (const [col, range] of Object.entries(dateFilters)) {
+    if (!columns.includes(col)) continue
+    const { from, to } = range || {}
+    if (from) {
+      conditions.push(`date(${quoteCol(col)}) >= date(?)`)
+      params.push(from)
+    }
+    if (to) {
+      conditions.push(`date(${quoteCol(col)}) <= date(?)`)
+      params.push(to)
+    }
+  }
+
   const whereSql = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
+  return { whereSql, params }
+}
+
+// Stream rows to a writable response. Avoids holding entire CSV in memory.
+export function streamCsvExport(res, filters = {}) {
+  if (!tableExists()) { res.end(''); return }
+  const columns = getColumns()
+  if (!columns.length) { res.end(''); return }
+
+  const { whereSql, params } = buildWhereClause(columns, filters)
   const colList = columns.map(quoteCol).join(', ')
 
   res.write('﻿') // UTF-8 BOM for Excel compatibility
@@ -616,6 +617,40 @@ export function streamCsvExport(res, filters = {}) {
     res.write(columns.map(c => csvEscapeCell(row[c])).join(',') + '\n')
   }
   res.end()
+}
+
+export function getColumnStats(column) {
+  if (!tableExists()) return null
+  const cols = getColumns()
+  if (!cols.includes(column)) return null
+  const q = quoteCol(column)
+  const r = db.prepare(`SELECT
+    COUNT(*) AS total,
+    SUM(CASE WHEN ${q} IS NULL OR ${q}='' THEN 1 ELSE 0 END) AS nullCount,
+    COUNT(DISTINCT ${q}) AS uniqueCount,
+    MIN(CASE WHEN CAST(${q} AS REAL) IS NOT NULL AND ${q} != '' THEN CAST(${q} AS REAL) END) AS numMin,
+    MAX(CASE WHEN CAST(${q} AS REAL) IS NOT NULL AND ${q} != '' THEN CAST(${q} AS REAL) END) AS numMax,
+    SUM(CAST(${q} AS REAL)) AS numSum,
+    AVG(CAST(${q} AS REAL)) AS numAvg,
+    MIN(${q}) AS strMin,
+    MAX(${q}) AS strMax
+  FROM "${TABLE}"`).get()
+  return { column, ...r }
+}
+
+export async function exportXlsx(filters = {}) {
+  if (!tableExists()) return null
+  const columns = getColumns()
+  if (!columns.length) return null
+  const { whereSql, params } = buildWhereClause(columns, filters)
+  const { read: _, utils, write } = await import('xlsx')
+  const colList = columns.map(quoteCol).join(', ')
+  const rows = db.prepare(`SELECT ${colList} FROM "${TABLE}"${whereSql}`).all(...params)
+  const wsData = [columns, ...rows.map(r => columns.map(c => r[c] ?? ''))]
+  const ws = utils.aoa_to_sheet(wsData)
+  const wb = utils.book_new()
+  utils.book_append_sheet(wb, ws, 'Data')
+  return write(wb, { type: 'buffer', bookType: 'xlsx' })
 }
 
 // ── Saved Views ───────────────────────────────────────────────────────────────
@@ -754,22 +789,26 @@ export function pivot({ rowDims = [], colDim = null, valueCol, agg = 'sum' }) {
   const groupBy = [...rowDims, ...(colDim ? [colDim] : [])].map(quoteCol).join(', ')
   const selectCols = [...rowDims, ...(colDim ? [colDim] : [])].map(quoteCol).join(', ')
 
-  const sql = `SELECT ${selectCols}${selectCols ? ',' : ''} ${aggExpr} AS _v FROM "${TABLE}" ${groupBy ? 'GROUP BY ' + groupBy : ''} LIMIT 50000`
+  const PIVOT_LIMIT = 50000
+  const sql = `SELECT ${selectCols}${selectCols ? ',' : ''} ${aggExpr} AS _v FROM "${TABLE}" ${groupBy ? 'GROUP BY ' + groupBy : ''} LIMIT ${PIVOT_LIMIT + 1}`
   const raw = db.prepare(sql).all()
+  const truncated = raw.length > PIVOT_LIMIT
+  const data = truncated ? raw.slice(0, PIVOT_LIMIT) : raw
 
   if (!colDim) {
     // 1D table
     return {
       rowDims,
       cols: ['_v'],
-      rows: raw.map(r => ({ keys: rowDims.map(d => r[d] ?? ''), values: { _v: r._v } }))
+      rows: data.map(r => ({ keys: rowDims.map(d => r[d] ?? ''), values: { _v: r._v } })),
+      truncated,
     }
   }
 
   // Pivot: bucket by colDim
   const colKeys = new Set()
   const map = new Map() // rowKey → { [colKey]: value }
-  for (const r of raw) {
+  for (const r of data) {
     const rk = rowDims.map(d => String(r[d] ?? '')).join('\x1f')
     const ck = String(r[colDim] ?? '')
     colKeys.add(ck)
@@ -778,5 +817,5 @@ export function pivot({ rowDims = [], colDim = null, valueCol, agg = 'sum' }) {
   }
   const colList = [...colKeys].sort()
   const rows = [...map.values()].map(o => ({ keys: o.__keys, values: Object.fromEntries(colList.map(c => [c, o[c] ?? null])) }))
-  return { rowDims, colDim, cols: colList, rows }
+  return { rowDims, colDim, cols: colList, rows, truncated }
 }

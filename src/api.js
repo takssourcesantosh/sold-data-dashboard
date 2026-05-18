@@ -109,12 +109,14 @@ export async function initDb() {
 
 export function tableExists() { return _meta.hasTable }
 
-export async function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [] } = {}) {
+export async function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [], dateFilters = {}, sortSpec = [] } = {}) {
   const params = new URLSearchParams({
     search, sortCol: sortCol || '', sortDir,
     columnFilters:   JSON.stringify(columnFilters),
     valueFilters:    JSON.stringify(valueFilters),
     advancedFilters: JSON.stringify(advancedFilters),
+    dateFilters:     JSON.stringify(dateFilters),
+    sortSpec:        JSON.stringify(sortSpec),
   })
   const res = await apiFetch(`/data/rows?${params}`)
   const data = await res.json()
@@ -184,6 +186,8 @@ export async function exportCsvAndDownload(filters = {}) {
     columnFilters: JSON.stringify(filters.columnFilters || {}),
     valueFilters: JSON.stringify(filters.valueFilters || {}),
     advancedFilters: JSON.stringify(filters.advancedFilters || []),
+    dateFilters: JSON.stringify(filters.dateFilters || {}),
+    sortSpec: JSON.stringify(filters.sortSpec || []),
   })
   const res = await apiFetch(`/data/export?${params}`, { timeout: 5 * 60_000 })
   const blob = await res.blob()
@@ -191,6 +195,31 @@ export async function exportCsvAndDownload(filters = {}) {
   const a = Object.assign(document.createElement('a'), { href: url, download: 'export.csv' })
   a.click()
   URL.revokeObjectURL(url)
+}
+
+export async function exportXlsxAndDownload(filters = {}) {
+  const params = new URLSearchParams({
+    search: filters.search || '',
+    sortCol: filters.sortCol || '',
+    sortDir: filters.sortDir || 'asc',
+    columnFilters: JSON.stringify(filters.columnFilters || {}),
+    valueFilters: JSON.stringify(filters.valueFilters || {}),
+    advancedFilters: JSON.stringify(filters.advancedFilters || []),
+    dateFilters: JSON.stringify(filters.dateFilters || {}),
+    sortSpec: JSON.stringify(filters.sortSpec || []),
+    format: 'xlsx',
+  })
+  const res = await apiFetch(`/data/export?${params}`, { timeout: 5 * 60_000 })
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = Object.assign(document.createElement('a'), { href: url, download: 'export.xlsx' })
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+export async function columnStatsApi(col) {
+  const res = await apiFetch(`/data/column-stats/${encodeURIComponent(col)}`)
+  return res.json()
 }
 
 export function getRowCount() { return _meta.rowCount }

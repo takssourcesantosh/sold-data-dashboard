@@ -11,6 +11,7 @@ import {
   listFormatting, saveFormatting,
   pivot,
   logAudit,
+  getColumnStats, exportXlsx,
 } from '../db.js'
 
 const router = Router()
@@ -18,6 +19,25 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100
 
 const MAX_HEADERS = 200
 const MAX_ROWS = 5_000_000
+
+function normalizeCell(val) {
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return ''
+    // Use LOCAL time — xlsx cellDates produces local-midnight for date-only cells.
+    // toISOString() would convert to UTC and shift the date in non-UTC timezones.
+    const yr  = val.getFullYear()
+    const mo  = String(val.getMonth() + 1).padStart(2, '0')
+    const dy  = String(val.getDate()).padStart(2, '0')
+    const h   = val.getHours()
+    const mi  = val.getMinutes()
+    const s   = val.getSeconds()
+    const date = `${yr}-${mo}-${dy}`
+    if (h === 0 && mi === 0 && s === 0) return date
+    return `${date} ${String(h).padStart(2,'0')}:${String(mi).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+  }
+  if (val === null || val === undefined) return ''
+  return val
+}
 
 async function parseBuffer(filename, buffer) {
   const ext = (filename || '').toLowerCase().split('.').pop()
@@ -31,7 +51,8 @@ async function parseBuffer(filename, buffer) {
     const [rawHeaders, ...dataRows] = raw
     if (rawHeaders.length > MAX_HEADERS) throw new Error(`Too many columns (max ${MAX_HEADERS})`)
     if (dataRows.length > MAX_ROWS) throw new Error(`Too many rows (max ${MAX_ROWS.toLocaleString()})`)
-    return { headers: sanitize(rawHeaders), dataRows }
+    const normalized = dataRows.map(row => row.map(normalizeCell))
+    return { headers: sanitize(rawHeaders), dataRows: normalized }
   } else if (ext === 'csv') {
     const text = buffer.toString('utf8')
     const { data, errors } = Papa.parse(text, { skipEmptyLines: true, dynamicTyping: false })
@@ -63,23 +84,22 @@ router.get('/meta', requireAuth, (req, res) => res.json(getMeta()))
 router.get('/rows', requireAuth, (req, res) => {
   try {
     const {
-      search = '',
-      sortCol = '',
-      sortDir = 'asc',
-      columnFilters: cfStr = '{}',
-      valueFilters: vfStr = '{}',
+      search = '', sortCol = '', sortDir = 'asc',
+      columnFilters: cfStr = '{}', valueFilters: vfStr = '{}',
       advancedFilters: afStr = '[]',
-      limit: limitStr = '100000',
-      offset: offsetStr = '0',
+      dateFilters: dfStr = '{}',
+      sortSpec: ssStr = '[]',
+      limit: limitStr = '1000000', offset: offsetStr = '0',
     } = req.query
     const result = queryRows({
       search,
-      sortCol: sortCol || null,
-      sortDir,
+      sortCol: sortCol || null, sortDir,
       columnFilters: JSON.parse(cfStr),
       valueFilters: JSON.parse(vfStr),
       advancedFilters: JSON.parse(afStr),
-      limit: Math.min(parseInt(limitStr, 10) || 100_000, 100_000),
+      dateFilters: JSON.parse(dfStr),
+      sortSpec: JSON.parse(ssStr),
+      limit: Math.min(parseInt(limitStr, 10) || 1_000_000, 1_000_000),
       offset: parseInt(offsetStr, 10) || 0,
     })
     res.json(result)
@@ -157,6 +177,7 @@ router.put('/cell', requireAdmin, (req, res) => {
   const { rowId, column, value } = req.body || {}
   if (rowId == null || !column) return res.status(400).json({ error: 'rowId and column required' })
   updateCell(rowId, column, value ?? '')
+  logAudit({ userId: req.user.id, username: req.user.username, action: 'data.cell_edit', details: { rowId, column, value }, ip: req.ip })
   res.json({ ok: true })
 })
 
@@ -167,28 +188,39 @@ router.get('/distinct/:col', requireAuth, (req, res) => {
 
 router.get('/export', requireAuth, (req, res) => {
   try {
-    const {
-      search = '',
-      sortCol = '',
-      sortDir = 'asc',
-      columnFilters: cfStr = '{}',
-      valueFilters: vfStr = '{}',
-      advancedFilters: afStr = '[]',
-    } = req.query
-    logAudit({ userId: req.user.id, username: req.user.username, action: 'data.export', ip: req.ip })
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
-    res.setHeader('Content-Disposition', 'attachment; filename="export.csv"')
-    streamCsvExport(res, {
-      search,
-      sortCol: sortCol || null,
-      sortDir,
-      columnFilters: JSON.parse(cfStr),
-      valueFilters: JSON.parse(vfStr),
-      advancedFilters: JSON.parse(afStr),
-    })
+    const { search='', sortCol='', sortDir='asc', columnFilters: cfStr='{}',
+      valueFilters: vfStr='{}', advancedFilters: afStr='[]',
+      dateFilters: dfStr='{}', sortSpec: ssStr='[]', format='csv' } = req.query
+    const filters = {
+      search, sortCol: sortCol||null, sortDir,
+      columnFilters: JSON.parse(cfStr), valueFilters: JSON.parse(vfStr),
+      advancedFilters: JSON.parse(afStr), dateFilters: JSON.parse(dfStr),
+      sortSpec: JSON.parse(ssStr),
+    }
+    logAudit({ userId: req.user.id, username: req.user.username, action: 'data.export', details: { format }, ip: req.ip })
+    if (format === 'xlsx') {
+      exportXlsx(filters).then(buf => {
+        if (!buf) return res.status(404).json({ error: 'No data' })
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        res.setHeader('Content-Disposition', 'attachment; filename="export.xlsx"')
+        res.send(buf)
+      }).catch(err => { if (!res.headersSent) res.status(500).json({ error: err.message }) })
+    } else {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+      res.setHeader('Content-Disposition', 'attachment; filename="export.csv"')
+      streamCsvExport(res, filters)
+    }
   } catch (err) {
     if (!res.headersSent) res.status(400).json({ error: err.message })
   }
+})
+
+router.get('/column-stats/:col', requireAuth, (req, res) => {
+  try {
+    const stats = getColumnStats(req.params.col)
+    if (!stats) return res.status(404).json({ error: 'Column not found' })
+    res.json(stats)
+  } catch (err) { res.status(400).json({ error: err.message }) }
 })
 
 // ── Saved Views ──────────────────────────────────────────────────────────────

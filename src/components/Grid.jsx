@@ -3,15 +3,16 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import ColumnValuePicker from './ColumnValuePicker'
 import { cellFormattingStyle } from './FormattingPanel'
 
-const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-const _dateRx = /^(\d{4})-(\d{2})-(\d{2})$/
+const _dateRx = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}:\d{2}:\d{2}))?/
 const _numFmt = new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 function fmtDate(val) {
   if (!val) return val
-  const m = _dateRx.exec(val)
+  const m = _dateRx.exec(String(val))
   if (!m) return val
-  return `${m[3]}-${MONTHS[parseInt(m[2], 10) - 1]}-${m[1]}`
+  const [, yr, mo, dy, time] = m
+  const base = `${dy}/${mo}/${yr}`
+  return time && time !== '00:00:00' ? `${base} ${time}` : base
 }
 
 function fmtFixed2(val) {
@@ -50,8 +51,17 @@ export default function Grid({
   valueFilters, onValueFilter, getDistinctValues,
   formattingRules, // [{column_name, rule}]
   totalCount,
+  hiddenColumns = [],
+  dateFilters = {},
+  onDateFilter,
+  frozenCount = 0,
+  sortSpec = [],
+  onColumnStats,
 }) {
-  const displayColumns = (columnOrder && columnOrder.length === columns.length) ? columnOrder : columns
+  const displayColumns = useMemo(() => {
+    const ordered = (columnOrder && columnOrder.length === columns.length) ? columnOrder : columns
+    return hiddenColumns.length ? ordered.filter(c => !hiddenColumns.includes(c)) : ordered
+  }, [columnOrder, columns, hiddenColumns])
   const parentRef = useRef(null)
   const gridRef = useRef(null)
 
@@ -136,6 +146,34 @@ export default function Grid({
     }
     return map
   }, [formattingRules, rows, columns])
+
+  // Sticky left offsets for frozen columns
+  const frozenLeftOffset = useMemo(() => {
+    const offsets = {}
+    let left = ROW_NUM_WIDTH
+    for (let i = 0; i < Math.min(frozenCount, displayColumns.length); i++) {
+      offsets[displayColumns[i]] = left
+      left += getColWidth(displayColumns[i])
+    }
+    return offsets
+  }, [frozenCount, displayColumns, getColWidth])
+
+  // Column totals (sum) for numeric columns
+  const columnTotals = useMemo(() => {
+    const totals = {}
+    for (const col of displayColumns) {
+      const idx = columns.indexOf(col)
+      if (idx < 0) continue
+      let sum = 0, hasNum = false
+      for (const row of rows) {
+        const n = parseFloat(row[idx + 1])
+        if (!isNaN(n)) { sum += n; hasNum = true }
+      }
+      if (hasNum) totals[col] = sum
+    }
+    return totals
+  }, [rows, columns, displayColumns])
+  const hasTotals = Object.keys(columnTotals).length > 0
 
   // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -369,18 +407,21 @@ export default function Grid({
       >
         <div className="grid-header-group" style={{ width: totalWidth }}>
           <div className="grid-header" style={{ height: HEADER_HEIGHT }}>
-            <div className="cell rn-cell" style={{ width: ROW_NUM_WIDTH }}>#</div>
-            {displayColumns.map((col) => {
+            <div className="cell rn-cell" style={{ width: ROW_NUM_WIDTH, position: 'sticky', left: 0, zIndex: 5 }}>#</div>
+            {displayColumns.map((col, colVisIdx) => {
               const hasValueFilter = valueFilters?.[col]?.length > 0
               const isDragging = dragCol === col
               const isDragOver = dragOverCol === col && dragCol !== col
+              const isFrozen = colVisIdx < frozenCount
+              const sortRank = sortSpec?.findIndex(s => s.col === col) ?? -1
+              const frozenStyle = isFrozen ? { position: 'sticky', left: frozenLeftOffset[col], zIndex: 4, background: 'var(--header-bg, var(--bg2))' } : {}
               return (
                 <div
                   key={col}
-                  className={`cell header-cell${sortCol === col ? ' sorted' : ''}${isDragging ? ' col-dragging' : ''}${isDragOver ? ' col-drag-over' : ''}`}
-                  style={{ width: getColWidth(col) }}
-                  onClick={() => onSort(col)}
-                  title={`Sort by ${col} · Drag to reorder`}
+                  className={`cell header-cell${sortCol === col ? ' sorted' : ''}${isDragging ? ' col-dragging' : ''}${isDragOver ? ' col-drag-over' : ''}${isFrozen ? ' col-frozen' : ''}`}
+                  style={{ width: getColWidth(col), ...frozenStyle }}
+                  onClick={(e) => onSort(col, e)}
+                  title={`Sort by ${col} · Ctrl+click multi-sort · Drag to reorder`}
                   draggable
                   onDragStart={(e) => {
                     setDragCol(col)
@@ -408,10 +449,18 @@ export default function Grid({
                       <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
                     </svg>
                   </button>
+                  <button
+                    className="col-stats-btn"
+                    onClick={(e) => { e.stopPropagation(); onColumnStats?.(col) }}
+                    title={`Column statistics: ${col}`}
+                    aria-label={`Stats for ${col}`}
+                  >ⓘ</button>
                   <span className="sort-arrow">
                     {sortCol === col
                       ? (sortDir === 'asc' ? '↑' : '↓')
-                      : <span className="sort-hint">↕</span>}
+                      : sortRank >= 0
+                        ? <span className="sort-multi">{sortRank + 1}{sortSpec[sortRank].dir === 'asc' ? '↑' : '↓'}</span>
+                        : <span className="sort-hint">↕</span>}
                   </span>
                   <span
                     className={`resize-handle${resizingCol === col ? ' resize-handle--active' : ''}`}
@@ -424,29 +473,54 @@ export default function Grid({
           </div>
 
           <div className="grid-filter-row" style={{ height: FILTER_HEIGHT }}>
-            <div className="cell rn-cell filter-rn" style={{ width: ROW_NUM_WIDTH }}>
+            <div className="cell rn-cell filter-rn" style={{ width: ROW_NUM_WIDTH, position: 'sticky', left: 0, zIndex: 3, background: 'var(--header-bg, var(--bg2))' }}>
               {(hasActiveFilters) && <span className="filter-dot" />}
             </div>
-            {displayColumns.map((col) => (
-              <div key={col} className="cell filter-cell" style={{ width: getColWidth(col) }}>
-                <input
-                  className="filter-input"
-                  type="text"
-                  placeholder="Filter…"
-                  value={columnFilters?.[col] ?? ''}
-                  onChange={(e) => onColumnFilter(col, e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.altKey && e.key === 'ArrowDown') {
-                      e.preventDefault()
-                      openPicker(col, { stopPropagation: () => {}, currentTarget: e.currentTarget })
-                    }
-                  }}
-                />
-                {columnFilters?.[col] && (
-                  <button className="filter-clear-btn" onClick={() => onColumnFilter(col, '')}>✕</button>
-                )}
-              </div>
-            ))}
+            {displayColumns.map((col, colVisIdx) => {
+              const isFrozen = colVisIdx < frozenCount
+              const frozenStyle = isFrozen ? { position: 'sticky', left: frozenLeftOffset[col], zIndex: 3, background: 'var(--header-bg, var(--bg2))' } : {}
+              const isDateCol = DATE_COL_RX.test(col)
+              return (
+                <div key={col} className="cell filter-cell" style={{ width: getColWidth(col), ...frozenStyle }}>
+                  {isDateCol ? (
+                    <div className="date-filter-wrap">
+                      <input type="date" className="filter-input date-filter-input"
+                        value={dateFilters?.[col]?.from || ''}
+                        onChange={e => onDateFilter?.(col, { ...(dateFilters?.[col] || {}), from: e.target.value })}
+                        title="From date"
+                      />
+                      <input type="date" className="filter-input date-filter-input"
+                        value={dateFilters?.[col]?.to || ''}
+                        onChange={e => onDateFilter?.(col, { ...(dateFilters?.[col] || {}), to: e.target.value })}
+                        title="To date"
+                      />
+                      {(dateFilters?.[col]?.from || dateFilters?.[col]?.to) && (
+                        <button className="filter-clear-btn" onClick={() => onDateFilter?.(col, null)}>✕</button>
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      <input
+                        className="filter-input"
+                        type="text"
+                        placeholder="Filter…"
+                        value={columnFilters?.[col] ?? ''}
+                        onChange={(e) => onColumnFilter(col, e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.altKey && e.key === 'ArrowDown') {
+                            e.preventDefault()
+                            openPicker(col, { stopPropagation: () => {}, currentTarget: e.currentTarget })
+                          }
+                        }}
+                      />
+                      {columnFilters?.[col] && (
+                        <button className="filter-clear-btn" onClick={() => onColumnFilter(col, '')}>✕</button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )
+            })}
           </div>
         </div>
 
@@ -482,12 +556,14 @@ export default function Grid({
                   const isFiltered = !!columnFilters?.[col]
                   const isInRange  = hasRange && inRange(vRow.index, colIdx)
                   const fmtStyle   = cellFormattingStyle(col, cellVal, formattingRules, heatmapStats)
+                  const isFrozen   = colIdx < frozenCount
+                  const frozenCellStyle = isFrozen ? { position: 'sticky', left: frozenLeftOffset[col], zIndex: 1, background: 'var(--cell-bg)' } : {}
 
                   return (
                     <div
                       key={col}
-                      className={`cell data-cell${isSel ? ' selected-cell' : ''}${isInRange ? ' range-cell' : ''}${isFiltered ? ' filtered-col' : ''}`}
-                      style={{ width: getColWidth(col), ...(fmtStyle ?? {}) }}
+                      className={`cell data-cell${isSel ? ' selected-cell' : ''}${isInRange ? ' range-cell' : ''}${isFiltered ? ' filtered-col' : ''}${isFrozen ? ' col-frozen' : ''}`}
+                      style={{ width: getColWidth(col), ...(fmtStyle ?? {}), ...frozenCellStyle }}
                       onClick={(e) => {
                         const ri = vRow.index
                         if (e.shiftKey && anchor) {
@@ -507,6 +583,22 @@ export default function Grid({
             )
           })}
         </div>
+
+        {/* Column totals row — sticky at bottom of scroll area */}
+        {hasTotals && (
+          <div className="grid-totals-row" style={{ width: totalWidth, minWidth: totalWidth }}>
+            <div className="cell rn-cell totals-rn" style={{ width: ROW_NUM_WIDTH, position: 'sticky', left: 0, zIndex: 2 }}>Σ</div>
+            {displayColumns.map((col, colIdx) => {
+              const isFrozen = colIdx < frozenCount
+              const stickyStyle = isFrozen ? { position: 'sticky', left: frozenLeftOffset[col], zIndex: 2 } : {}
+              return (
+                <div key={col} className="cell totals-cell" style={{ width: getColWidth(col), ...stickyStyle }}>
+                  {columnTotals[col] != null ? _numFmt.format(columnTotals[col]) : ''}
+                </div>
+              )
+            })}
+          </div>
+        )}
       </div>
 
       <div className="grid-footer">
