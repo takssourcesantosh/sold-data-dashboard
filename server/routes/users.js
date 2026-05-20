@@ -7,14 +7,14 @@ import {
 
 const router = Router()
 
-const MIN_PASSWORD_LEN = 10
+const MIN_PASSWORD_LEN = 8
 const MAX_USERNAME_LEN = 64
 const MAX_AVATAR_BYTES = 200 * 1024 // 200 KB
 const AVATAR_RX = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/
 
 const COMMON_PASSWORDS = new Set([
   'password', 'password1', 'password123', '12345678', '123456789', '1234567890',
-  'qwerty123', 'admin123', 'letmein1', 'welcome1', 'iloveyou1',
+  'qwerty123', 'letmein1', 'welcome1', 'iloveyou1',
 ])
 
 function validatePassword(pw) {
@@ -24,7 +24,7 @@ function validatePassword(pw) {
   if (COMMON_PASSWORDS.has(pw.toLowerCase())) return 'Password is too common'
   // Require at least 2 of: lower, upper, digit, symbol
   const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter(rx => rx.test(pw)).length
-  if (classes < 2) return 'Password must mix at least 2 of: lowercase, uppercase, digit, symbol'
+  if (classes < 2) return 'Password must include at least 2 of: lowercase letter, uppercase letter, number, symbol (e.g. Admin@123)'
   return null
 }
 
