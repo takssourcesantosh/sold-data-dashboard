@@ -83,9 +83,7 @@ export default function ProfilePanel({ currentUser, onClose, onProfileUpdate }) 
     e.preventDefault()
     setPwdErr(''); setPwdMsg('')
     if (newPwd !== confirmPwd) { setPwdErr('Passwords do not match'); return }
-    if (newPwd.length < 10)    { setPwdErr('Password must be at least 10 characters'); return }
-    const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter(rx => rx.test(newPwd)).length
-    if (classes < 2)           { setPwdErr('Password must mix at least 2 of: lowercase, uppercase, digit, symbol'); return }
+    if (newPwd.length < 8)    { setPwdErr('Password must be at least 8 characters'); return }
     setPwdSaving(true)
     try {
       await updateMyPassword(curPwd, newPwd)
