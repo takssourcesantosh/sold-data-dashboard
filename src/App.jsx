@@ -264,10 +264,6 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
           }
         } catch {}
 
-        if (profile.must_change_password) {
-          toast.warn('Please change your password before continuing.', { ttl: 0 })
-          setProfileOpen(true)
-        }
 
         // Load formatting rules
         loadFormatting()

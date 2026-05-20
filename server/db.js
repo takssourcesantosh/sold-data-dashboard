@@ -193,7 +193,7 @@ export function seedUsersFromConfig(configUsers) {
   if (count > 0) return
   for (const u of configUsers) {
     db.prepare(
-      'INSERT OR IGNORE INTO _users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 1)'
+      'INSERT OR IGNORE INTO _users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 0)'
     ).run(u.username, hashPassword(u.password), u.role)
   }
 }
