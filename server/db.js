@@ -53,8 +53,7 @@ export function initDb() {
   _m('ALTER TABLE _users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0')
   _m('ALTER TABLE _users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0')
   _m('ALTER TABLE _users ADD COLUMN locked_until TEXT')
-  // Clear forced password-change flag for all existing users
-  db.exec('UPDATE _users SET must_change_password = 0')
+  _m('UPDATE _users SET must_change_password = 0')
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS _audit_log (
