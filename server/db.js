@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite'
+import Database from 'better-sqlite3'
 import { mkdirSync, existsSync } from 'fs'
 import { scryptSync, randomBytes, timingSafeEqual } from 'crypto'
 import path from 'path'
@@ -17,7 +17,7 @@ export function initDb() {
   const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'sheet.db')
   const dir = path.dirname(dbPath)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-  db = new DatabaseSync(dbPath)
+  db = new Database(dbPath)
   db.exec('PRAGMA journal_mode=WAL')
   db.exec('PRAGMA synchronous=NORMAL')
   db.exec('PRAGMA foreign_keys=ON')
