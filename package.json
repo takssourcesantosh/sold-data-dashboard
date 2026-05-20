@@ -11,7 +11,7 @@
     "dev:client": "vite",
     "dev": "concurrently -n server,client -c blue,green \"npm run dev:server\" \"npm run dev:client\"",
     "build": "vite build",
-    "start": "node server/index.js",
+    "start": "node --experimental-sqlite server/index.js",
     "preview": "vite preview"
   },
   "dependencies": {
