@@ -67,12 +67,15 @@ router.put('/me/avatar', requireAuth, (req, res) => {
   const { avatar } = req.body || {}
   const err = validateAvatar(avatar)
   if (err) return res.status(400).json({ error: err })
-  updateUserAvatar(req.user.id, avatar ?? null)
-  res.json({ ok: true })
+  try {
+    updateUserAvatar(req.user.id, avatar ?? null)
+    res.json({ ok: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 router.get('/', requireAdmin, (req, res) => {
-  res.json(listAllUsers())
+  try { res.json(listAllUsers()) }
+  catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 router.post('/', requireAdmin, (req, res) => {
@@ -131,7 +134,8 @@ router.delete('/:id', requireAdmin, (req, res) => {
 })
 
 router.get('/audit', requireAdmin, (req, res) => {
-  res.json(listAudit({ limit: 500 }))
+  try { res.json(listAudit({ limit: 500 })) }
+  catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 export default router

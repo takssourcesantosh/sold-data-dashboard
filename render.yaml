@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: sold-data-dashboard
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: USERS
+        value: admin:admin123:admin
+    disk:
+      name: data
+      mountPath: /app/data
+      sizeGB: 1

@@ -12,7 +12,7 @@ const AGGS = [
 
 const _fmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 })
 
-export default function PivotPanel({ columns, onClose }) {
+export default function PivotPanel({ columns, filters = {}, onClose }) {
   const [rowDims, setRowDims] = useState([])
   const [colDim, setColDim] = useState('')
   const [valueCol, setValueCol] = useState('')
@@ -35,7 +35,7 @@ export default function PivotPanel({ columns, onClose }) {
     if (!valueCol) return toast.warn('Pick a value column')
     setLoading(true)
     setResult(null)
-    try { setResult(await pivotApi({ rowDims, colDim: colDim || null, valueCol, agg })) }
+    try { setResult(await pivotApi({ rowDims, colDim: colDim || null, valueCol, agg, filters })) }
     catch (e) { toast.error(e.message) }
     setLoading(false)
   }

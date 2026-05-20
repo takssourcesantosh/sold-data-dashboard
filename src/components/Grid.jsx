@@ -3,16 +3,45 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import ColumnValuePicker from './ColumnValuePicker'
 import { cellFormattingStyle } from './FormattingPanel'
 
-const _dateRx = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}:\d{2}:\d{2}))?/
 const _numFmt = new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const _months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+const _monthIdx = Object.fromEntries(_months.map((m, i) => [m.toLowerCase(), i]))
 
 function fmtDate(val) {
   if (!val) return val
-  const m = _dateRx.exec(String(val))
-  if (!m) return val
-  const [, yr, mo, dy, time] = m
-  const base = `${dy}/${mo}/${yr}`
-  return time && time !== '00:00:00' ? `${base} ${time}` : base
+  const s = String(val).trim()
+
+  // 1. ISO: YYYY-MM-DD [T/space HH:MM:SS] — always strip time
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s)
+  if (iso) {
+    const [, yr, mo, dy] = iso
+    const mon = _months[parseInt(mo, 10) - 1]
+    return `${dy}-${mon}-${yr}`
+  }
+
+  // 2. DD-MMM-YYYY [HH:MM:SS]  e.g. "01-Jan-2025 23:59:28" — strip time
+  const dmy = /^(\d{2})[\/\-]([A-Za-z]{3})[\/\-](\d{4})/.exec(s)
+  if (dmy) {
+    const [, dy, mon, yr] = dmy
+    return `${dy}-${mon.charAt(0).toUpperCase() + mon.slice(1).toLowerCase()}-${yr}`
+  }
+
+  // 3. JS Date.toString(): "Wed Jan 01 2025 23:59:28 GMT..."
+  const jsd = /^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{2})\s+(\d{4})(?:\s+(\d{2}:\d{2}:\d{2}))?/.exec(s)
+  if (jsd) {
+    const [, mon, dy, yr] = jsd
+    return `${dy}-${mon.charAt(0).toUpperCase() + mon.slice(1).toLowerCase()}-${yr}`
+  }
+
+  // 4. MM/DD/YYYY or MM-DD-YYYY
+  const mdy = /^(\d{2})[\/\-](\d{2})[\/\-](\d{4})/.exec(s)
+  if (mdy) {
+    const [, mm, dd, yr] = mdy
+    const mon = _months[parseInt(mm, 10) - 1]
+    return mon ? `${dd}-${mon}-${yr}` : s
+  }
+
+  return val
 }
 
 function fmtFixed2(val) {
@@ -157,23 +186,6 @@ export default function Grid({
     }
     return offsets
   }, [frozenCount, displayColumns, getColWidth])
-
-  // Column totals (sum) for numeric columns
-  const columnTotals = useMemo(() => {
-    const totals = {}
-    for (const col of displayColumns) {
-      const idx = columns.indexOf(col)
-      if (idx < 0) continue
-      let sum = 0, hasNum = false
-      for (const row of rows) {
-        const n = parseFloat(row[idx + 1])
-        if (!isNaN(n)) { sum += n; hasNum = true }
-      }
-      if (hasNum) totals[col] = sum
-    }
-    return totals
-  }, [rows, columns, displayColumns])
-  const hasTotals = Object.keys(columnTotals).length > 0
 
   // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -584,21 +596,7 @@ export default function Grid({
           })}
         </div>
 
-        {/* Column totals row — sticky at bottom of scroll area */}
-        {hasTotals && (
-          <div className="grid-totals-row" style={{ width: totalWidth, minWidth: totalWidth }}>
-            <div className="cell rn-cell totals-rn" style={{ width: ROW_NUM_WIDTH, position: 'sticky', left: 0, zIndex: 2 }}>Σ</div>
-            {displayColumns.map((col, colIdx) => {
-              const isFrozen = colIdx < frozenCount
-              const stickyStyle = isFrozen ? { position: 'sticky', left: frozenLeftOffset[col], zIndex: 2 } : {}
-              return (
-                <div key={col} className="cell totals-cell" style={{ width: getColWidth(col), ...stickyStyle }}>
-                  {columnTotals[col] != null ? _numFmt.format(columnTotals[col]) : ''}
-                </div>
-              )
-            })}
-          </div>
-        )}
+
       </div>
 
       <div className="grid-footer">

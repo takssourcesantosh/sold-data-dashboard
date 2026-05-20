@@ -19,6 +19,7 @@ import {
   setStoredUser,
   listFormattingApi,
   onBroadcast,
+  refreshTokenIfNeeded,
 } from './api'
 import Grid from './components/Grid'
 import Toolbar from './components/Toolbar'
@@ -35,6 +36,10 @@ import FormattingPanel from './components/FormattingPanel'
 import DiffPanel from './components/DiffPanel'
 import PivotPanel from './components/PivotPanel'
 import ColumnStatsPanel from './components/ColumnStatsPanel'
+import AiQueryBar from './components/AiQueryBar'
+import AiInsightsPanel from './components/AiInsightsPanel'
+import AiSummaryModal from './components/AiSummaryModal'
+import AiToolsPanel from './components/AiToolsPanel'
 import { getRecentSearches, addRecentSearch, readViewFromUrl, clearViewHash, buildShareUrl } from './lib/view-state'
 
 class ErrorBoundary extends Component {
@@ -118,6 +123,10 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
   const [formattingOpen, setFormattingOpen] = useState(false)
   const [diffOpen, setDiffOpen] = useState(false)
   const [pivotOpen, setPivotOpen] = useState(false)
+  const [aiQueryOpen, setAiQueryOpen] = useState(false)
+  const [aiInsightsOpen, setAiInsightsOpen] = useState(false)
+  const [aiSummaryOpen, setAiSummaryOpen] = useState(false)
+  const [aiToolsOpen, setAiToolsOpen] = useState(false)
   const [recentOpen, setRecentOpen] = useState(false)
   const [recentSearches, setRecentSearches] = useState(() => getRecentSearches())
   const [formattingRules, setFormattingRules] = useState([])
@@ -238,13 +247,19 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
 
         // JWT expiry warning
         try {
-          const token = localStorage.getItem('bd-token')
-          if (token) {
-            const payload = JSON.parse(atob(token.split('.')[1]))
-            const expiresIn = payload.exp * 1000 - Date.now()
-            if (expiresIn < 24 * 60 * 60 * 1000) {
-              const hrs = Math.round(expiresIn / (60 * 60 * 1000))
-              toast.warn(`Session expires in ${hrs} hour${hrs !== 1 ? 's' : ''}. Log out and in again to renew.`, { ttl: 0 })
+          // Auto-refresh token if < 24 h remaining; warn only if refresh fails
+          const refreshed = await refreshTokenIfNeeded()
+          if (!refreshed) {
+            const token = localStorage.getItem('bd-token')
+            if (token) {
+              try {
+                const payload = JSON.parse(atob(token.split('.')[1]))
+                const expiresIn = payload.exp * 1000 - Date.now()
+                if (expiresIn < 24 * 60 * 60 * 1000) {
+                  const hrs = Math.round(expiresIn / (60 * 60 * 1000))
+                  toast.warn(`Session expires in ${hrs} hour${hrs !== 1 ? 's' : ''}. Log out and in again to renew.`, { ttl: 0 })
+                }
+              } catch {}
             }
           }
         } catch {}
@@ -292,6 +307,10 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
           toast.info('Data changed in another tab. Refreshing…')
           loadData()
           loadBackups()
+          break
+        case 'auth.expired':
+          // Session expired/revoked in any tab → reload all tabs to login
+          window.location.reload()
           break
         default: break
       }
@@ -438,6 +457,27 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
     catch { toast.info(url) }
   }
 
+  const handleAiResetFilters = useCallback(() => {
+    const next = { ...stateRef.current, search: '', columnFilters: {}, advancedFilters: [], valueFilters: {} }
+    stateRef.current = next
+    setSearch('')
+    setColumnFilters({})
+    setAdvancedFilters([])
+    setValueFilters({})
+    loadData()
+  }, [loadData]) // eslint-disable-line
+
+  const handleAiApplyFilters = useCallback((filters) => {
+    if (!filters) return
+    const next = { ...stateRef.current }
+    if (filters.search != null) next.search = filters.search
+    if (filters.columnFilters) next.columnFilters = { ...next.columnFilters, ...filters.columnFilters }
+    if (filters.advancedFilters?.length) next.advancedFilters = filters.advancedFilters
+    stateRef.current = next
+    setSearch(next.search || '')
+    loadData()
+  }, [loadData]) // eslint-disable-line
+
   // Notify on triggered alerts (after upload/append)
   const notifyTriggeredAlerts = (triggered) => {
     if (!triggered?.length) return
@@ -458,6 +498,7 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
       loadData()
       loadBackups()
       notifyTriggeredAlerts(data?.triggeredAlerts)
+      setAiInsightsOpen(true)
     } catch (err) {
       toast.error('Upload failed: ' + err.message)
     } finally {
@@ -635,6 +676,10 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
         onOpenDiff={() => setDiffOpen(true)}
         onOpenPivot={() => setPivotOpen(true)}
         onShareCurrent={handleShareCurrent}
+        onAiQuery={() => setAiQueryOpen(v => !v)}
+        onAiSummary={() => setAiSummaryOpen(true)}
+        onAiTools={() => setAiToolsOpen(true)}
+        aiQueryOpen={aiQueryOpen}
         columns={columns}
         hiddenColumns={hiddenColumns}
         onToggleColumn={handleToggleColumn}
@@ -732,8 +777,13 @@ function Dashboard({ currentUser: initialUser, onLogout }) {
       )}
 
       {diffOpen && <DiffPanel onClose={() => setDiffOpen(false)} />}
-      {pivotOpen && hasData && <PivotPanel columns={columns} onClose={() => setPivotOpen(false)} />}
+      {pivotOpen && hasData && <PivotPanel columns={columns} filters={stateRef.current} onClose={() => setPivotOpen(false)} />}
       {statsCol && <ColumnStatsPanel col={statsCol} onClose={() => setStatsCol(null)} />}
+
+      {aiQueryOpen && <AiQueryBar onApplyFilters={handleAiApplyFilters} onResetFilters={handleAiResetFilters} onClose={() => setAiQueryOpen(false)} />}
+      {aiInsightsOpen && <AiInsightsPanel onDismiss={() => setAiInsightsOpen(false)} />}
+      {aiSummaryOpen && <AiSummaryModal filters={stateRef.current} onClose={() => setAiSummaryOpen(false)} />}
+      {aiToolsOpen && <AiToolsPanel columns={columns} onClose={() => setAiToolsOpen(false)} />}
 
       {ConfirmModal}
     </div>

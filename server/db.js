@@ -8,6 +8,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const TABLE = 'sheet'
 let db
 
+export function getDbInstance() {
+  if (!db) throw new Error('Database not initialized')
+  return db
+}
+
 export function initDb() {
   const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'sheet.db')
   const dir = path.dirname(dbPath)
@@ -26,7 +31,8 @@ export function initDb() {
     )
   `)
   // Add pinned col if existing schema doesn't have it
-  try { db.exec('ALTER TABLE _backup_meta ADD COLUMN pinned INTEGER DEFAULT 0') } catch {}
+  try { db.exec('ALTER TABLE _backup_meta ADD COLUMN pinned INTEGER DEFAULT 0') }
+  catch (e) { if (!e.message?.includes('duplicate column')) console.warn('[db] migration _backup_meta.pinned:', e.message) }
   db.exec(`
     CREATE TABLE IF NOT EXISTS _users (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,10 +48,11 @@ export function initDb() {
     )
   `)
   // Migrations for older installs
-  try { db.exec('ALTER TABLE _users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0') } catch {}
-  try { db.exec('ALTER TABLE _users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0') } catch {}
-  try { db.exec('ALTER TABLE _users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0') } catch {}
-  try { db.exec('ALTER TABLE _users ADD COLUMN locked_until TEXT') } catch {}
+  const _m = (sql) => { try { db.exec(sql) } catch (e) { if (!e.message?.includes('duplicate column')) console.warn('[db] migration:', e.message) } }
+  _m('ALTER TABLE _users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0')
+  _m('ALTER TABLE _users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0')
+  _m('ALTER TABLE _users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0')
+  _m('ALTER TABLE _users ADD COLUMN locked_until TEXT')
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS _audit_log (
@@ -95,7 +102,50 @@ export function initDb() {
     )
   `)
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _rate_limits (
+      key       TEXT PRIMARY KEY,
+      count     INTEGER NOT NULL DEFAULT 1,
+      reset_at  INTEGER NOT NULL
+    )
+  `)
+
+  // Performance indexes
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_users_username    ON _users(username)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_backup_meta_slot  ON _backup_meta(slot)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_backup_meta_time  ON _backup_meta(created_at)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_user        ON _audit_log(user_id)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_alerts_user       ON _alerts(user_id)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_formatting_user   ON _formatting(user_id)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_rate_limits_reset ON _rate_limits(reset_at)`)
+
   return db
+}
+
+// ── Rate limiting (DB-backed, survives restarts) ──────────────────────────────
+
+const RATE_WINDOW = 15 * 60 * 1000 // 15 min in ms
+const RATE_MAX    = 10
+
+export function checkRateLimit(ip, username) {
+  const key = `${ip}::${(username || '').toLowerCase().trim()}`
+  const now  = Date.now()
+  // Clean stale entry
+  db.prepare('DELETE FROM _rate_limits WHERE reset_at < ?').run(now)
+  const row = db.prepare('SELECT count, reset_at FROM _rate_limits WHERE key=?').get(key)
+  if (!row) {
+    db.prepare('INSERT INTO _rate_limits (key, count, reset_at) VALUES (?,1,?)').run(key, now + RATE_WINDOW)
+    return { ok: true }
+  }
+  if (row.count >= RATE_MAX) {
+    return { ok: false, retryIn: row.reset_at - now }
+  }
+  db.prepare('UPDATE _rate_limits SET count=count+1 WHERE key=?').run(key)
+  return { ok: true }
+}
+
+export function clearExpiredRateLimits() {
+  db.prepare('DELETE FROM _rate_limits WHERE reset_at < ?').run(Date.now())
 }
 
 // ── Audit ────────────────────────────────────────────────────────────────────
@@ -471,7 +521,7 @@ function buildAdvancedCondition(col, op, val, params) {
   }
 }
 
-export function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [], dateFilters = {}, sortSpec = [], limit = 100_000, offset = 0 } = {}) {
+export function queryRows({ search = '', sortCol = null, sortDir = 'asc', columnFilters = {}, valueFilters = {}, advancedFilters = [], dateFilters = {}, sortSpec = [], limit = 1_000_000, offset = 0 } = {}) {
   if (!tableExists()) return { columns: [], rows: [], totalCount: 0 }
 
   const columns = getColumns()
@@ -587,12 +637,24 @@ function buildWhereClause(columns, filters = {}) {
   for (const [col, range] of Object.entries(dateFilters)) {
     if (!columns.includes(col)) continue
     const { from, to } = range || {}
+    if (!from && !to) continue
+    const dq = quoteCol(col)
+    // Sample stored values to detect format → build format-aware ISO conversion expr
+    let isoExpr
+    try {
+      const samples = db.prepare(
+        `SELECT ${dq} AS v FROM "${TABLE}" WHERE ${dq} IS NOT NULL AND ${dq} != '' LIMIT 10`
+      ).all().map(r => r.v).filter(Boolean)
+      isoExpr = buildIsoDateExpr(dq, samples)
+    } catch (_) {
+      isoExpr = `date(${dq})`
+    }
     if (from) {
-      conditions.push(`date(${quoteCol(col)}) >= date(?)`)
+      conditions.push(`${isoExpr} >= ?`)
       params.push(from)
     }
     if (to) {
-      conditions.push(`date(${quoteCol(col)}) <= date(?)`)
+      conditions.push(`${isoExpr} <= ?`)
       params.push(to)
     }
   }
@@ -624,20 +686,202 @@ export function getColumnStats(column) {
   const cols = getColumns()
   if (!cols.includes(column)) return null
   const q = quoteCol(column)
+  // Use GLOB-based numeric detection to avoid false positives:
+  // CAST('abc' AS REAL) = 0.0 in SQLite, so plain CAST check incorrectly
+  // treats text columns as numeric. GLOB '[0-9]*' only matches real numbers.
+  const numGuard = `(${q} GLOB '[0-9]*' OR ${q} GLOB '-[0-9]*') AND ${q} != '' AND ${q} IS NOT NULL`
   const r = db.prepare(`SELECT
     COUNT(*) AS total,
     SUM(CASE WHEN ${q} IS NULL OR ${q}='' THEN 1 ELSE 0 END) AS nullCount,
     COUNT(DISTINCT ${q}) AS uniqueCount,
-    MIN(CASE WHEN CAST(${q} AS REAL) IS NOT NULL AND ${q} != '' THEN CAST(${q} AS REAL) END) AS numMin,
-    MAX(CASE WHEN CAST(${q} AS REAL) IS NOT NULL AND ${q} != '' THEN CAST(${q} AS REAL) END) AS numMax,
-    SUM(CAST(${q} AS REAL)) AS numSum,
-    AVG(CAST(${q} AS REAL)) AS numAvg,
+    MIN(CASE WHEN ${numGuard} THEN CAST(${q} AS REAL) END) AS numMin,
+    MAX(CASE WHEN ${numGuard} THEN CAST(${q} AS REAL) END) AS numMax,
+    SUM(CASE WHEN ${numGuard} THEN CAST(${q} AS REAL) ELSE 0 END) AS numSum,
+    AVG(CASE WHEN ${numGuard} THEN CAST(${q} AS REAL) END) AS numAvg,
     MIN(${q}) AS strMin,
     MAX(${q}) AS strMax
   FROM "${TABLE}"`).get()
+  // If numMin is NULL, no numeric values were found — clear numeric fields
+  if (r.numMin == null) { r.numSum = null; r.numAvg = null }
   return { column, ...r }
 }
 
+// ── AI helper queries ─────────────────────────────────────────────────────────
+
+// Returns per-column sample values for AI context (max 8 unique non-empty samples per col)
+export function getColumnSamples(maxPerCol = 8) {
+  if (!tableExists()) return {}
+  const cols = getColumns()
+  const result = {}
+  for (const col of cols) {
+    const q = quoteCol(col)
+    const rows = db.prepare(`SELECT DISTINCT ${q} AS v FROM "${TABLE}" WHERE ${q} IS NOT NULL AND ${q} != '' LIMIT ?`).all(maxPerCol)
+    result[col] = rows.map(r => r.v)
+  }
+  return result
+}
+
+// Returns duplicate candidate clusters (rows sharing same values in key columns)
+// keyColumns: subset of columns to group by (e.g. cert number, shape+carat+color+clarity)
+export function findDuplicateClusters(keyColumns) {
+  if (!tableExists()) return []
+  const cols = getColumns()
+  const valid = keyColumns.filter(c => cols.includes(c))
+  if (!valid.length) return []
+  const groupCols = valid.map(quoteCol).join(', ')
+  const selectCols = valid.map(c => `${quoteCol(c)} AS ${quoteCol(c)}`).join(', ')
+  const rows = db.prepare(
+    `SELECT ${selectCols}, COUNT(*) AS cnt FROM "${TABLE}" GROUP BY ${groupCols} HAVING cnt > 1 ORDER BY cnt DESC LIMIT 200`
+  ).all()
+  return rows
+}
+
+// Returns cert numbers (from cert-like columns) appearing more than once
+export function findReusedCerts() {
+  if (!tableExists()) return { certColumn: null, reused: [] }
+  const cols = getColumns()
+  const certCol = cols.find(c => /cert|certificate|gia|igi|hrd|lab|report/i.test(c))
+  if (!certCol) return { certColumn: null, reused: [] }
+  const q = quoteCol(certCol)
+  const reused = db.prepare(
+    `SELECT ${q} AS cert, COUNT(*) AS cnt FROM "${TABLE}" WHERE ${q} IS NOT NULL AND ${q} != '' GROUP BY ${q} HAVING cnt > 1 ORDER BY cnt DESC LIMIT 100`
+  ).all()
+  return { certColumn: certCol, reused }
+}
+
+// Detect date format from sample values and return SQLite period expression (YYYY-MM)
+// Shared month-name → ISO-number CASE block
+const _MONTH_CASE_TMPL = (expr) =>
+  `CASE ${expr} WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03'` +
+  ` WHEN 'Apr' THEN '04' WHEN 'May' THEN '05' WHEN 'Jun' THEN '06'` +
+  ` WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08' WHEN 'Sep' THEN '09'` +
+  ` WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12' ELSE '00' END`
+
+// Detect stored date format from samples → return SQL expr yielding 'YYYY-MM' for GROUP BY
+function buildPeriodExpr(dq, sampleVals) {
+  const monthYr = (mExpr, yExpr) => `${yExpr} || '-' || ${_MONTH_CASE_TMPL(mExpr)}`
+
+  // ISO: YYYY-MM-DD or YYYY/MM/DD (with optional time)
+  if (sampleVals.some(v => /^\d{4}[-/]\d{2}[-/]\d{2}/.test(v)))
+    return `strftime('%Y-%m', replace(${dq}, '/', '-'))`
+
+  // DD-MMM-YYYY [HH:MM:SS]  e.g. "15-Jan-2025" or "15-Jan-2025 23:59:28"
+  if (sampleVals.some(v => /^\d{2}-[A-Za-z]{3}-\d{4}/.test(v)))
+    return monthYr(`substr(${dq}, 4, 3)`, `substr(${dq}, 8, 4)`)
+
+  // DD/MMM/YYYY [HH:MM:SS]  e.g. "15/Jan/2025"
+  if (sampleVals.some(v => /^\d{2}\/[A-Za-z]{3}\/\d{4}/.test(v)))
+    return monthYr(`substr(${dq}, 4, 3)`, `substr(${dq}, 8, 4)`)
+
+  // JS Date.toString(): "Wed Jan 01 2025 23:59:28 GMT..."
+  if (sampleVals.some(v => /^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{2}\s+\d{4}/.test(v)))
+    return monthYr(`substr(${dq}, 5, 3)`, `substr(${dq}, 12, 4)`)
+
+  // MM/DD/YYYY or MM-DD-YYYY
+  if (sampleVals.some(v => /^\d{2}[\/\-]\d{2}[\/\-]\d{4}/.test(v)))
+    return `substr(${dq}, 7, 4) || '-' || substr(${dq}, 1, 2)`
+
+  // Fallback: hope it's SQLite-compatible
+  return `strftime('%Y-%m', ${dq})`
+}
+
+// Detect stored date format from samples → return SQL expr yielding 'YYYY-MM-DD' for range comparison
+function buildIsoDateExpr(dq, sampleVals) {
+  const monthNum = (expr) => _MONTH_CASE_TMPL(expr)
+
+  // ISO: YYYY-MM-DD (with optional time/TZ)
+  if (sampleVals.some(v => /^\d{4}[-/]\d{2}[-/]\d{2}/.test(v)))
+    return `substr(replace(${dq}, '/', '-'), 1, 10)`
+
+  // DD-MMM-YYYY [HH:MM:SS]  e.g. "01-Jan-2025 23:59:28"
+  if (sampleVals.some(v => /^\d{2}-[A-Za-z]{3}-\d{4}/.test(v)))
+    return `substr(${dq}, 8, 4) || '-' || ${monthNum(`substr(${dq}, 4, 3)`)} || '-' || substr(${dq}, 1, 2)`
+
+  // DD/MMM/YYYY [HH:MM:SS]
+  if (sampleVals.some(v => /^\d{2}\/[A-Za-z]{3}\/\d{4}/.test(v)))
+    return `substr(${dq}, 8, 4) || '-' || ${monthNum(`substr(${dq}, 4, 3)`)} || '-' || substr(${dq}, 1, 2)`
+
+  // JS Date.toString(): "Wed Jan 01 2025 23:59:28 GMT..."
+  if (sampleVals.some(v => /^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{2}\s+\d{4}/.test(v)))
+    return `substr(${dq}, 12, 4) || '-' || ${monthNum(`substr(${dq}, 5, 3)`)} || '-' || substr(${dq}, 9, 2)`
+
+  // MM/DD/YYYY or MM-DD-YYYY
+  if (sampleVals.some(v => /^\d{2}[\/\-]\d{2}[\/\-]\d{4}/.test(v)))
+    return `substr(${dq}, 7, 4) || '-' || substr(${dq}, 1, 2) || '-' || substr(${dq}, 4, 2)`
+
+  // Fallback
+  return `date(${dq})`
+}
+
+// Returns time series: date column grouped by month, aggregated value column
+export function getTimeSeries(dateCol, valueCol, agg = 'sum', limit = 24) {
+  if (!tableExists()) return []
+  const cols = getColumns()
+  if (!cols.includes(dateCol) || !cols.includes(valueCol)) return []
+  const dq = quoteCol(dateCol)
+  const vq = quoteCol(valueCol)
+
+  // Sample date values to detect format
+  const samples = db.prepare(
+    `SELECT ${dq} AS v FROM "${TABLE}" WHERE ${dq} IS NOT NULL AND ${dq} != '' LIMIT 20`
+  ).all().map(r => r.v).filter(Boolean)
+
+  const periodExpr = buildPeriodExpr(dq, samples)
+  const aggExpr = agg === 'count' ? 'COUNT(*)' : `${agg.toUpperCase()}(CAST(${vq} AS REAL))`
+
+  const rows = db.prepare(
+    `SELECT ${periodExpr} AS period, ${aggExpr} AS value
+     FROM "${TABLE}"
+     WHERE ${dq} IS NOT NULL AND ${dq} != ''
+     GROUP BY period
+     HAVING period IS NOT NULL AND period != '' AND period != '-00'
+     ORDER BY period DESC LIMIT ?`
+  ).all(limit)
+  return rows.reverse()
+}
+
+// Returns aggregated stats for a specific buyer value
+export function getBuyerStats(buyerCol, buyerValue) {
+  if (!tableExists()) return null
+  const cols = getColumns()
+  if (!cols.includes(buyerCol)) return null
+  const bq = quoteCol(buyerCol)
+  const total = db.prepare(`SELECT COUNT(*) AS cnt FROM "${TABLE}" WHERE ${bq} = ?`).get(buyerValue)
+  // Collect numeric col stats for this buyer
+  const numCols = ['Amount','RATE','RAP DIS','RAP RTE','Carats','Carat'].filter(c => cols.includes(c))
+  const numStats = {}
+  for (const nc of numCols) {
+    const nq = quoteCol(nc)
+    const s = db.prepare(`SELECT SUM(CAST(${nq} AS REAL)) AS s, AVG(CAST(${nq} AS REAL)) AS a, MIN(CAST(${nq} AS REAL)) AS mn, MAX(CAST(${nq} AS REAL)) AS mx FROM "${TABLE}" WHERE ${bq} = ?`).get(buyerValue)
+    numStats[nc] = s
+  }
+  // Top categories
+  const catCols = ['Shape','Color','Clarity','Cut','Polish','Symmetry'].filter(c => cols.includes(c))
+  const topCats = {}
+  for (const cc of catCols) {
+    const cq = quoteCol(cc)
+    const top = db.prepare(`SELECT ${cq} AS v, COUNT(*) AS cnt FROM "${TABLE}" WHERE ${bq} = ? AND ${cq} != '' GROUP BY ${cq} ORDER BY cnt DESC LIMIT 3`).all(buyerValue)
+    topCats[cc] = top.map(r => r.v)
+  }
+  return { total: total.cnt, numStats, topCats }
+}
+
+// Returns overall stats for percentile computation
+export function getColumnPercentile(column, value) {
+  if (!tableExists()) return null
+  const cols = getColumns()
+  if (!cols.includes(column)) return null
+  const q = quoteCol(column)
+  const numVal = parseFloat(value)
+  if (isNaN(numVal)) return null
+  const r = db.prepare(
+    `SELECT COUNT(*) AS total, SUM(CASE WHEN CAST(${q} AS REAL) <= ? THEN 1 ELSE 0 END) AS below FROM "${TABLE}" WHERE ${q} GLOB '[0-9]*' OR ${q} GLOB '-[0-9]*'`
+  ).get(numVal)
+  if (!r || r.total === 0) return null
+  return Math.round((r.below / r.total) * 100)
+}
+
+const XLSX_ROW_CAP = 500_000
 export async function exportXlsx(filters = {}) {
   if (!tableExists()) return null
   const columns = getColumns()
@@ -645,7 +889,7 @@ export async function exportXlsx(filters = {}) {
   const { whereSql, params } = buildWhereClause(columns, filters)
   const { read: _, utils, write } = await import('xlsx')
   const colList = columns.map(quoteCol).join(', ')
-  const rows = db.prepare(`SELECT ${colList} FROM "${TABLE}"${whereSql}`).all(...params)
+  const rows = db.prepare(`SELECT ${colList} FROM "${TABLE}"${whereSql} LIMIT ${XLSX_ROW_CAP}`).all(...params)
   const wsData = [columns, ...rows.map(r => columns.map(c => r[c] ?? ''))]
   const ws = utils.aoa_to_sheet(wsData)
   const wb = utils.book_new()
@@ -774,7 +1018,7 @@ export function saveFormatting(userId, rules) {
 
 // ── Pivot ─────────────────────────────────────────────────────────────────────
 
-export function pivot({ rowDims = [], colDim = null, valueCol, agg = 'sum' }) {
+export function pivot({ rowDims = [], colDim = null, valueCol, agg = 'sum', filters = {} }) {
   if (!tableExists()) return { rowDims: [], cols: [], rows: [] }
   const cols = getColumns()
   for (const d of rowDims) if (!cols.includes(d)) throw new Error(`Unknown dimension: ${d}`)
@@ -789,9 +1033,11 @@ export function pivot({ rowDims = [], colDim = null, valueCol, agg = 'sum' }) {
   const groupBy = [...rowDims, ...(colDim ? [colDim] : [])].map(quoteCol).join(', ')
   const selectCols = [...rowDims, ...(colDim ? [colDim] : [])].map(quoteCol).join(', ')
 
+  const { whereSql, params } = buildWhereClause(cols, filters)
+
   const PIVOT_LIMIT = 50000
-  const sql = `SELECT ${selectCols}${selectCols ? ',' : ''} ${aggExpr} AS _v FROM "${TABLE}" ${groupBy ? 'GROUP BY ' + groupBy : ''} LIMIT ${PIVOT_LIMIT + 1}`
-  const raw = db.prepare(sql).all()
+  const sql = `SELECT ${selectCols}${selectCols ? ',' : ''} ${aggExpr} AS _v FROM "${TABLE}"${whereSql} ${groupBy ? 'GROUP BY ' + groupBy : ''} LIMIT ${PIVOT_LIMIT + 1}`
+  const raw = db.prepare(sql).all(...params)
   const truncated = raw.length > PIVOT_LIMIT
   const data = truncated ? raw.slice(0, PIVOT_LIMIT) : raw
 

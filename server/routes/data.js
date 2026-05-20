@@ -79,7 +79,10 @@ function sanitize(rawHeaders) {
 
 // ── Core data routes ─────────────────────────────────────────────────────────
 
-router.get('/meta', requireAuth, (req, res) => res.json(getMeta()))
+router.get('/meta', requireAuth, (req, res) => {
+  try { res.json(getMeta()) }
+  catch (err) { res.status(500).json({ error: err.message }) }
+})
 
 router.get('/rows', requireAuth, (req, res) => {
   try {
@@ -127,6 +130,7 @@ router.post('/append', requireAdmin, upload.single('file'), async (req, res) => 
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
     const { headers, dataRows } = await parseBuffer(req.file.originalname, req.file.buffer)
+    createBackup(`pre-append: ${req.file.originalname}`)
     appendFromCSV(headers, dataRows)
     logAudit({ userId: req.user.id, username: req.user.username, action: 'data.append', details: { rows: dataRows.length, file: req.file.originalname }, ip: req.ip })
     const triggered = evaluateAlerts()
@@ -164,7 +168,7 @@ router.post('/backups/:slot/pin', requireAdmin, (req, res) => {
   res.json({ ok: true })
 })
 
-router.get('/diff/:slot', requireAuth, (req, res) => {
+router.get('/diff/:slot', requireAdmin, (req, res) => {
   try {
     const slot = parseInt(req.params.slot, 10)
     res.json(diffBackup(slot))
@@ -296,8 +300,8 @@ router.put('/formatting', requireAuth, (req, res) => {
 
 router.post('/pivot', requireAuth, (req, res) => {
   try {
-    const { rowDims, colDim, valueCol, agg } = req.body || {}
-    res.json(pivot({ rowDims: rowDims || [], colDim: colDim || null, valueCol, agg }))
+    const { rowDims, colDim, valueCol, agg, filters = {} } = req.body || {}
+    res.json(pivot({ rowDims: rowDims || [], colDim: colDim || null, valueCol, agg, filters }))
   } catch (err) { res.status(400).json({ error: err.message }) }
 })
 

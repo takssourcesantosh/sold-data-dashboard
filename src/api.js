@@ -63,11 +63,13 @@ async function apiFetch(path, opts = {}) {
     clearTimeout(timer)
   }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    const msg = err.error || res.statusText
-    // Session-killing statuses → broadcast logout
-    if (res.status === 401 && (msg === 'Session revoked. Please log in again.' || msg === 'Invalid token' || msg === 'Unauthorized')) {
-      // let caller handle (they reload)
+    const errBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
+    const msg = errBody.error || res.statusText
+    // Auto-logout on 401 session errors — broadcast so all tabs react
+    if (res.status === 401) {
+      broadcast('auth.expired')
+      // Remove token so next page load shows login
+      setToken(null)
     }
     throw new Error(msg)
   }
@@ -96,6 +98,23 @@ export async function logoutApi() {
   setToken(null)
   setStoredUser(null)
   broadcast('auth.logout')
+}
+
+// Silently refresh token if it expires within 24 h. Returns new token or null.
+export async function refreshTokenIfNeeded() {
+  const token = getToken()
+  if (!token) return null
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]))
+    const expiresIn = payload.exp * 1000 - Date.now()
+    if (expiresIn > 24 * 60 * 60 * 1000) return null // more than 24 h left — no need
+    const res = await apiFetch('/auth/refresh', { method: 'POST', timeout: 5000 })
+    const data = await res.json()
+    setToken(data.token)
+    return data.token
+  } catch {
+    return null
+  }
 }
 
 // ── DB shims (mirror src/db.js API) ──────────────────────────────────────────
@@ -324,7 +343,7 @@ export async function saveFormattingApi(rules) {
 
 // ── Pivot ─────────────────────────────────────────────────────────────────────
 
-export async function pivotApi({ rowDims, colDim, valueCol, agg }) {
-  const res = await apiFetch('/data/pivot', { method: 'POST', body: { rowDims, colDim, valueCol, agg } })
+export async function pivotApi({ rowDims, colDim, valueCol, agg, filters = {} }) {
+  const res = await apiFetch('/data/pivot', { method: 'POST', body: { rowDims, colDim, valueCol, agg, filters } })
   return res.json()
 }

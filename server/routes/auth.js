@@ -1,37 +1,15 @@
 import { Router } from 'express'
 import jwt from 'jsonwebtoken'
-import { findUserByCredentials, logAudit, getUserTokenVersion, bumpUserTokenVersion } from '../db.js'
+import { findUserByCredentials, logAudit, getUserTokenVersion, bumpUserTokenVersion, checkRateLimit, clearExpiredRateLimits } from '../db.js'
 import { JWT_SECRET, JWT_TTL } from '../auth-config.js'
 import { requireAuth } from '../middleware/auth.js'
 
 const router = Router()
 
-// Sliding-window rate limit: per (IP, username). 10 attempts / 15 min.
-const attempts = new Map() // key → { count, reset }
-const WINDOW = 15 * 60 * 1000
-const MAX = 10
-
-function rlKey(ip, username) {
-  return `${ip}::${(username || '').toLowerCase().trim()}`
-}
-
-function checkRate(ip, username) {
-  const now = Date.now()
-  const key = rlKey(ip, username)
-  const entry = attempts.get(key)
-  if (entry && now < entry.reset) {
-    if (entry.count >= MAX) return { ok: false, retryIn: entry.reset - now }
-    entry.count++
-  } else {
-    attempts.set(key, { count: 1, reset: now + WINDOW })
-  }
-  return { ok: true }
-}
-
-// Periodic cleanup of stale entries (avoid unbounded growth)
+// Periodic cleanup of stale DB rate-limit entries
 setInterval(() => {
-  const now = Date.now()
-  for (const [k, v] of attempts) if (v.reset < now) attempts.delete(k)
+  try { clearExpiredRateLimits() }
+  catch (err) { console.error('[auth] rate-limit cleanup failed:', err.message) }
 }, 5 * 60 * 1000).unref?.()
 
 router.post('/login', (req, res) => {
@@ -40,7 +18,7 @@ router.post('/login', (req, res) => {
     return res.status(400).json({ error: 'Username and password required' })
 
   const ip = req.ip || 'unknown'
-  const rate = checkRate(ip, username)
+  const rate = checkRateLimit(ip, username)
   if (!rate.ok) {
     return res.status(429).json({ error: `Too many attempts. Try again in ${Math.ceil(rate.retryIn / 60000)} minutes.` })
   }
@@ -70,6 +48,18 @@ router.post('/login', (req, res) => {
       must_change_password: result.user.must_change_password ?? 0,
     },
   })
+})
+
+// Refresh: exchange a still-valid token for a fresh one with full TTL.
+router.post('/refresh', requireAuth, (req, res) => {
+  const tv = getUserTokenVersion(req.user.id)
+  const token = jwt.sign(
+    { id: req.user.id, username: req.user.username, role: req.user.role, tv },
+    JWT_SECRET,
+    { expiresIn: JWT_TTL }
+  )
+  logAudit({ userId: req.user.id, username: req.user.username, action: 'token.refresh', ip: req.ip })
+  res.json({ token })
 })
 
 // Logout: bump token_version → all existing tokens invalid.

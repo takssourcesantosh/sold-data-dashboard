@@ -16,6 +16,7 @@ export default function Toolbar({
   onOpenShortcuts,
   onOpenViews, onOpenAlerts, onOpenFormatting, onOpenDiff, onOpenPivot,
   onShareCurrent,
+  onAiQuery, onAiSummary, onAiTools, aiQueryOpen,
   columns = [], hiddenColumns = [], onToggleColumn, onShowAllColumns,
   frozenCount = 0, onSetFrozenCount,
 }) {
@@ -311,6 +312,15 @@ export default function Toolbar({
             <span className="backup-count">{backupCount}</span>
           </button>
         )}
+
+        <div className="tb-group">
+          <button
+            className={`btn tb-btn ai-tb-btn${aiQueryOpen ? ' active' : ''}`}
+            onClick={onAiQuery}
+            title="AI natural language query (Alt+A)"
+          >✨ AI Query</button>
+          <button className="btn tb-btn ai-tb-btn" onClick={onAiTools} title="AI tools: duplicates, forecasting, buyer profiles">🔧 AI Tools</button>
+        </div>
 
         {hasData && (
           <div className="split-btn-wrap" ref={exportRef}>
